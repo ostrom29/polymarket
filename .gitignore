@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Paper trading logs (can be large, keep locally)
+paper_trades.jsonl
+*.jsonl
+
+# Market data snapshots
+all_markets.json
+markets_snapshot_*.xlsx
+
+# Scratch / exploration files
+simulate.py
+arbitrage_scanner.py
+scratch_*.py
+
+# Env / secrets
+.env
+*.key
+
+# Generated pair files (regenerate with getotken.py)
+wc_pairs.json
+friendlies_pairs.json
+friendlies_tokens.json
