@@ -3,11 +3,17 @@ import websockets
 import json
 import os
 from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 
 from arbitrage import PricingEngine, NLegDetector
 from paper_trader import PaperTrader
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Only watch matches starting within this window (or already ongoing).
+# 12h covers a full CdM match day without locking capital on tomorrow's games.
+TRADE_WINDOW_HOURS = 12
+TARGET_SHARES = 10
 
 # Token → set of pair_ids that include it (reverse index for fast lookup on price update)
 TokenIndex = dict[str, set[str]]
@@ -37,7 +43,7 @@ class LiveOrderBook:
 class OrderBookManager:
     def __init__(self, paper_trader: PaperTrader | None = None):
         self.books: dict[str, LiveOrderBook] = {}
-        self.pricing_engine = PricingEngine(target_shares=50.0)
+        self.pricing_engine = PricingEngine(target_shares=float(TARGET_SHARES))
         self.detector = NLegDetector(self.pricing_engine)
         self.paper_trader = paper_trader
         self._token_index: TokenIndex = {}  # token_id → {pair_id, ...}
@@ -125,37 +131,58 @@ async def stream_market_data(token_ids: list[str], manager: OrderBookManager) ->
             await asyncio.sleep(5)
 
 
+def _is_in_trade_window(game_start_time: str | None) -> bool:
+    """Return True if the match is ongoing or starts within TRADE_WINDOW_HOURS."""
+    if not game_start_time:
+        return True  # no time info → don't filter
+    try:
+        gst = datetime.fromisoformat(game_start_time.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        # Keep if: match started less than 2h ago (ongoing) OR starts within window
+        return (now - timedelta(hours=2)) <= gst <= (now + timedelta(hours=TRADE_WINDOW_HOURS))
+    except Exception:
+        return True  # can't parse → don't filter
+
+
 def _load_pairs(preferred: str = "wc_pairs.json", fallback: str = "friendlies_pairs.json"):
     """
-    Load pairs config from wc_pairs.json (new format) or friendlies_pairs.json (legacy).
+    Load pairs config, apply temporal filter (TRADE_WINDOW_HOURS).
     Returns (pairs_list, tokens_list).
     """
-    # Try new format first
     for filename in (preferred, fallback):
         if not os.path.exists(filename):
             continue
         with open(filename, "r") as f:
             config = json.load(f)
 
+        raw_pairs = config.get("pairs", [])
+        if not raw_pairs:
+            continue
+
         # New format: pairs have a 'pair_id' and 'tokens' list
-        if config.get("pairs") and "tokens" in config["pairs"][0]:
-            tokens = config.get("all_tokens", [])
-            print(f"📂 Loaded {len(config['pairs'])} pairs from {filename} (new format)")
-            return config["pairs"], tokens
+        if "tokens" in raw_pairs[0]:
+            pairs = [p for p in raw_pairs if _is_in_trade_window(p.get("game_start_time"))]
+            tokens = list({t for p in pairs for t in p["tokens"]})
+            skipped = len(raw_pairs) - len(pairs)
+            print(f"📂 {filename}: {len(raw_pairs)} pairs → {len(pairs)} in window "
+                  f"({skipped} skipped, outside ±{TRADE_WINDOW_HOURS}h)")
+            return pairs, tokens
 
         # Legacy format: pairs have 'strict_no' / 'broad_yes'
         legacy_pairs = []
-        for p in config.get("pairs", []):
+        for p in raw_pairs:
             legacy_pairs.append({
                 "pair_id": f"{p['match_id']}::btts_vs_o15",
                 "match_id": p["match_id"],
                 "strategy": "btts_vs_o15",
                 "tokens": [p["strict_no"], p["broad_yes"]],
                 "label": p.get("label", "NO BTTS + YES O1.5"),
+                "game_start_time": None,
             })
-        tokens = config.get("all_tokens", [])
-        print(f"📂 Loaded {len(legacy_pairs)} pairs from {filename} (legacy format)")
-        return legacy_pairs, tokens
+        pairs = [p for p in legacy_pairs if _is_in_trade_window(p.get("game_start_time"))]
+        tokens = list({t for p in pairs for t in p["tokens"]})
+        print(f"📂 {filename} (legacy): {len(pairs)} pairs in window")
+        return pairs, tokens
 
     return [], []
 
@@ -175,7 +202,7 @@ if __name__ == "__main__":
     for s, n in sorted(by_strat.items()):
         print(f"   {s:20} : {n} pairs")
 
-    paper = PaperTrader(target_shares=Decimal("50"), log_file="paper_trades.jsonl")
+    paper = PaperTrader(target_shares=Decimal(str(TARGET_SHARES)), log_file="paper_trades.jsonl")
     manager = OrderBookManager(paper_trader=paper)
 
     for p in pairs:

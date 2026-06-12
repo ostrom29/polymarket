@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
 SOCCER_TAG_ID = 100350
+MIN_VOLUME_24H = 5_000  # USD — ignore illiquid matches below this threshold
 
 
 def extract_base_slug(slug: str) -> str:
@@ -45,10 +46,10 @@ def _team_names_from_title(title: str) -> tuple[str, str]:
     return home, away
 
 
-def _scan_markets(markets: list, title: str) -> dict:
+def _scan_markets(markets: list, title: str) -> tuple[dict, str | None]:
     """
     Extract all relevant tokens from a list of sub-markets.
-    Returns a dict with token IDs for each role, or None for missing.
+    Returns (slots, game_start_time) where slots maps role → token_id (None if missing).
     """
     home, away = _team_names_from_title(title)
 
@@ -65,8 +66,13 @@ def _scan_markets(markets: list, title: str) -> dict:
         "draw_yes": None,
         "away_yes": None,
     }
+    game_start_time: str | None = None
 
     for sm in markets:
+        # Grab the first non-null gameStartTime we find
+        if game_start_time is None and sm.get("gameStartTime"):
+            game_start_time = sm["gameStartTime"]
+
         sm_type = sm.get("sportsMarketType") or ""
         question = (sm.get("question") or "").lower()
         clob = _parse_clob_ids(sm.get("clobTokenIds"))
@@ -110,10 +116,16 @@ def _scan_markets(markets: list, title: str) -> dict:
                 if slots["away_yes"] is None:
                     slots["away_yes"] = yes_tok
 
-    return slots
+    return slots, game_start_time
 
 
-def _build_pairs(match_id: str, title: str, slots: dict) -> list[dict]:
+def _build_pairs(
+    match_id: str,
+    title: str,
+    slots: dict,
+    volume24hr: float,
+    game_start_time: str | None,
+) -> list[dict]:
     """Assemble valid strategy pairs from extracted token slots."""
     pairs: list[dict] = []
 
@@ -126,6 +138,8 @@ def _build_pairs(match_id: str, title: str, slots: dict) -> list[dict]:
                 "strategy": strategy,
                 "tokens": tokens,
                 "label": label,
+                "volume24hr": volume24hr,
+                "game_start_time": game_start_time,
             })
 
     _add("btts_vs_o15", [slots["btts_no"], slots["o15_yes"]], "NO BTTS + YES O1.5")
@@ -170,11 +184,16 @@ def fetch_all_pairs(output_file: str = "wc_pairs.json") -> None:
             base_slug = extract_base_slug(slug)
             title = event.get("title") or ""
             markets = event.get("markets") or []
+            vol = float(event.get("volume24hr") or 0)
 
             if base_slug not in markets_by_slug:
-                markets_by_slug[base_slug] = {"title": title, "markets": []}
+                markets_by_slug[base_slug] = {"title": title, "markets": [], "volume24hr": 0.0}
             # Merge markets from all events sharing the same base_slug (incl. -more-markets)
             markets_by_slug[base_slug]["markets"].extend(markets)
+            # Keep the highest volume seen across all events with the same base_slug
+            markets_by_slug[base_slug]["volume24hr"] = max(
+                markets_by_slug[base_slug]["volume24hr"], vol
+            )
 
         offset += limit
         time.sleep(0.05)
@@ -183,17 +202,25 @@ def fetch_all_pairs(output_file: str = "wc_pairs.json") -> None:
     all_pairs: list[dict] = []
     all_tokens: set[str] = set()
 
+    skipped_low_vol = 0
     for base_slug, data in markets_by_slug.items():
         title = data["title"]
-        slots = _scan_markets(data["markets"], title)
-        pairs = _build_pairs(base_slug, title, slots)
+        volume24hr = data["volume24hr"]
+
+        if volume24hr < MIN_VOLUME_24H:
+            skipped_low_vol += 1
+            continue
+
+        slots, game_start_time = _scan_markets(data["markets"], title)
+        pairs = _build_pairs(base_slug, title, slots, volume24hr, game_start_time)
 
         if pairs:
             all_pairs.extend(pairs)
             for p in pairs:
                 all_tokens.update(p["tokens"])
             strategies = {p["strategy"] for p in pairs}
-            print(f"  ✅ {title[:42]:<42} | {', '.join(sorted(strategies))}")
+            vol_str = f"${int(volume24hr):,}"
+            print(f"  ✅ {title[:38]:<38} | {vol_str:>8} | {', '.join(sorted(strategies))}")
 
     # Strategy breakdown
     by_strategy: dict[str, int] = {}
@@ -212,7 +239,8 @@ def fetch_all_pairs(output_file: str = "wc_pairs.json") -> None:
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"\n🎉 {len(all_pairs)} pairs across {len(markets_by_slug)} matches → {output_file}")
+    print(f"\n🎉 {len(all_pairs)} pairs across {len(markets_by_slug) - skipped_low_vol} matches → {output_file}")
+    print(f"   ({skipped_low_vol} matches skipped — volume24hr < ${MIN_VOLUME_24H:,})")
     for strat, count in sorted(by_strategy.items()):
         print(f"   {strat:20} : {count} pairs")
 

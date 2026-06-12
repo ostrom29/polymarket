@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv
 
 # Paper trading logs (can be large, keep locally)
 paper_trades.jsonl
