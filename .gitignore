@@ -20,6 +20,9 @@ scratch_*.py
 .env
 *.key
 
+# Execution logs
+execution.log
+
 # Generated pair files (regenerate with getotken.py)
 wc_pairs.json
 friendlies_pairs.json

@@ -1,12 +1,15 @@
 import asyncio
 import websockets
 import json
+import logging
 import os
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 
 from arbitrage import PricingEngine, NLegDetector
-from paper_trader import PaperTrader
+from paper_trader import PaperTrader, BREAKEVEN_GROSS
+
+log = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -41,11 +44,16 @@ class LiveOrderBook:
 
 
 class OrderBookManager:
-    def __init__(self, paper_trader: PaperTrader | None = None):
+    def __init__(
+        self,
+        paper_trader: PaperTrader | None = None,
+        executor=None,  # execution.executor.ExecutionEngine | None
+    ):
         self.books: dict[str, LiveOrderBook] = {}
         self.pricing_engine = PricingEngine(target_shares=float(TARGET_SHARES))
         self.detector = NLegDetector(self.pricing_engine)
         self.paper_trader = paper_trader
+        self.executor = executor
         self._token_index: TokenIndex = {}  # token_id → {pair_id, ...}
 
     def register_pair(self, pair: dict) -> None:
@@ -62,8 +70,9 @@ class OrderBookManager:
     def _evaluate_pairs(self, asset_id: str) -> None:
         for pair_id in self._token_index.get(asset_id, set()):
             vwaps, total_cost = self.detector.check(pair_id, self.books)
+            pair = self.detector.pairs[pair_id]
+
             if self.paper_trader:
-                pair = self.detector.pairs[pair_id]
                 self.paper_trader.on_tick(
                     pair_id=pair_id,
                     match_id=pair_id.split("::")[0],
@@ -71,6 +80,22 @@ class OrderBookManager:
                     label=pair["label"],
                     vwaps=vwaps,
                     total_cost=total_cost,
+                )
+
+            # Fire execution only when the signal is net-profitable after fees
+            if (
+                self.executor is not None
+                and total_cost is not None
+                and Decimal(str(round(total_cost, 8))) < BREAKEVEN_GROSS
+            ):
+                asyncio.create_task(
+                    self.executor.execute(
+                        pair_id=pair_id,
+                        strategy=pair["strategy"],
+                        tokens=pair["tokens"],
+                        books=self.books,
+                        target_shares=TARGET_SHARES,
+                    )
                 )
 
     def process_message(self, message: str) -> None:
@@ -187,7 +212,35 @@ def _load_pairs(preferred: str = "wc_pairs.json", fallback: str = "friendlies_pa
     return [], []
 
 
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("execution.log"),
+        ],
+    )
+
+
+def _load_env(path: str = ".env") -> None:
+    from pathlib import Path
+    if not Path(path).exists():
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
 if __name__ == "__main__":
+    _load_env()
+    _setup_logging()
+
     pairs, tokens = _load_pairs()
 
     if not pairs:
@@ -202,14 +255,30 @@ if __name__ == "__main__":
     for s, n in sorted(by_strat.items()):
         print(f"   {s:20} : {n} pairs")
 
+    # Execution engine — shadow mode unless explicitly disabled in .env
+    shadow_mode = os.environ.get("SHADOW_MODE", "true").lower() != "false"
+    executor = None
+    try:
+        from execution.executor import ExecutionEngine
+        executor = ExecutionEngine(shadow_mode=shadow_mode)
+        mode_label = "SHADOW" if shadow_mode else "⚡ LIVE"
+        print(f"\n🔧 Execution engine: {mode_label}")
+    except ImportError:
+        print("\n⚠️  execution/ module not found — running paper trading only")
+    except Exception as e:
+        print(f"\n⚠️  Executor init failed ({e}) — running paper trading only")
+
     paper = PaperTrader(target_shares=Decimal(str(TARGET_SHARES)), log_file="paper_trades.jsonl")
-    manager = OrderBookManager(paper_trader=paper)
+    manager = OrderBookManager(paper_trader=paper, executor=executor)
 
     for p in pairs:
         manager.register_pair(p)
 
-    print(f"\n📋 Paper trading ON — {len(pairs)} pairs | {len(tokens)} tokens")
-    print(f"📁 Log: paper_trades.jsonl\n")
+    mode_str = "SHADOW execution" if (executor and shadow_mode) else \
+               "LIVE execution" if (executor and not shadow_mode) else \
+               "paper trading only"
+    print(f"\n📋 {mode_str} | {len(pairs)} pairs | {len(tokens)} tokens")
+    print(f"📁 Log: paper_trades.jsonl  |  execution.log\n")
 
     try:
         asyncio.run(stream_market_data(tokens, manager))
