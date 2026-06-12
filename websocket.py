@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from arbitrage import PricingEngine, NLegDetector
 from paper_trader import PaperTrader
+import notify
 
 log = logging.getLogger(__name__)
 
@@ -321,6 +322,9 @@ if __name__ == "__main__":
         log.warning("Executor init failed (%s) — running paper trading only", e)
 
     paper = PaperTrader(target_shares=Decimal(str(TARGET_SHARES)), log_file="paper_trades.jsonl")
+
+    mode_label = "SHADOW" if shadow_mode else "LIVE"
+    notify.send(f"🤖 Polymarket bot démarré ({mode_label})\nPairs actives : chargement en cours...")
 
     async def _main() -> None:
         asyncio.create_task(_refresh_loop(PAIRS_FILE))

@@ -32,6 +32,7 @@ from typing import Optional
 from .auth import build_client
 from .order_builder import build_buy, OrderSpec
 from .position_guard import PositionGuard, FilledLeg
+import notify
 
 log = logging.getLogger(__name__)
 
@@ -376,6 +377,16 @@ class ExecutionEngine:
 
         if result.shadow:
             self._write_shadow_record(result)
+
+        if result.success:
+            mode = "🔵 SHADOW" if result.shadow else "🟢 LIVE"
+            notify.send(
+                f"{mode} Trade exécuté ✅\n"
+                f"Stratégie : {result.strategy}\n"
+                f"Gross : {float(result.actual_gross):.4f}\n"
+                f"Net/share : +{float(result.actual_net_per_share):.4f}\n"
+                f"Durée : {result.duration_ms:.0f}ms"
+            )
 
     def _write_shadow_record(self, result: ExecutionResult) -> None:
         legs_data = []
