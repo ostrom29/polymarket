@@ -58,12 +58,16 @@ def _scan_markets(markets: list, title: str) -> tuple[dict, str | None, Decimal]
     slots: dict[str, str | None] = {
         "btts_no": None,
         "btts_yes": None,
+        "o05_yes": None,
+        "o05_no": None,
         "o15_yes": None,
         "o15_no": None,
         "o25_yes": None,
         "o25_no": None,
         "o35_yes": None,
         "o35_no": None,
+        "o45_yes": None,
+        "o45_no": None,
         "home_yes": None,
         "draw_yes": None,
         "away_yes": None,
@@ -108,7 +112,10 @@ def _scan_markets(markets: list, title: str) -> tuple[dict, str | None, Decimal]
             except ValueError:
                 continue
 
-            if abs(line - 1.5) < 0.01:
+            if abs(line - 0.5) < 0.01:
+                slots["o05_yes"] = yes_tok
+                slots["o05_no"] = no_tok
+            elif abs(line - 1.5) < 0.01:
                 slots["o15_yes"] = yes_tok
                 slots["o15_no"] = no_tok
             elif abs(line - 2.5) < 0.01:
@@ -117,6 +124,9 @@ def _scan_markets(markets: list, title: str) -> tuple[dict, str | None, Decimal]
             elif abs(line - 3.5) < 0.01:
                 slots["o35_yes"] = yes_tok
                 slots["o35_no"] = no_tok
+            elif abs(line - 4.5) < 0.01:
+                slots["o45_yes"] = yes_tok
+                slots["o45_no"] = no_tok
 
         else:
             # 1X2: identify by question text — moneyline or any question with team name + win
@@ -159,9 +169,26 @@ def _build_pairs(
                 "fee_rate": float(fee_rate),
             })
 
+    # ── Guaranteed-coverage (inclusion) pairs ────────────────────────────────
+    # Each pair covers ALL possible scorelines — at least one leg always wins.
+    #
+    # Proof sketch for totals chains:
+    #   YES On + NO Om  (n < m): wins when goals≥n+1 OR goals≤m → impossible to lose both
+    #   since goals≥n+1 AND goals≤m covers everything except goals≤n, which NO Om covers.
+    #   The only uncovered case would need goals≤n AND goals>m simultaneously → impossible.
+
+    # Adjacent totals (tightest spread — most likely to be near fair value)
+    _add("o05_vs_o15",  [slots["o05_yes"], slots["o15_no"]], "YES O0.5 + NO O1.5")
     _add("btts_vs_o15", [slots["btts_no"], slots["o15_yes"]], "NO BTTS + YES O1.5")
     _add("o15_vs_o25",  [slots["o15_yes"], slots["o25_no"]], "YES O1.5 + NO O2.5")
     _add("o25_vs_o35",  [slots["o25_yes"], slots["o35_no"]], "YES O2.5 + NO O3.5")
+    _add("o35_vs_o45",  [slots["o35_yes"], slots["o45_no"]], "YES O3.5 + NO O4.5")
+
+    # Wide-gap totals (skip one level — catches mispricing across a broader range)
+    _add("o15_vs_o35",  [slots["o15_yes"], slots["o35_no"]], "YES O1.5 + NO O3.5")
+    _add("o25_vs_o45",  [slots["o25_yes"], slots["o45_no"]], "YES O2.5 + NO O4.5")
+
+    # 1X2 surebet (always 3-leg — Home+Draw+Away exhausts all outcomes)
     _add("1x2_surebet", [slots["home_yes"], slots["draw_yes"], slots["away_yes"]],
          "YES Home + YES Draw + YES Away")
 
