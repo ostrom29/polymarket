@@ -22,6 +22,7 @@ scratch_*.py
 
 # Execution logs
 execution.log
+shadow_trades.jsonl
 
 # Generated pair files (regenerate with getotken.py)
 wc_pairs.json

@@ -19,11 +19,14 @@ Shadow mode (SHADOW_MODE=true in .env):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 
 from .auth import build_client
@@ -370,3 +373,40 @@ class ExecutionEngine:
                 result.error,
                 f"{result.duration_ms:.0f}" if result.duration_ms else "?",
             )
+
+        if result.shadow:
+            self._write_shadow_record(result)
+
+    def _write_shadow_record(self, result: ExecutionResult) -> None:
+        legs_data = []
+        for lr in result.legs:
+            leg = {
+                "token_id": lr.token_id,
+                "limit_price": str(lr.spec.limit_price),
+                "expected_vwap": str(lr.spec.expected_vwap),
+                "expected_cost": str(lr.spec.expected_cost),
+                "size": lr.spec.size,
+            }
+            if lr.filled:
+                leg["fill_price"] = str(lr.filled.avg_fill_price)
+            if lr.error:
+                leg["error"] = lr.error
+            legs_data.append(leg)
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "pair_id": result.pair_id,
+            "strategy": result.strategy,
+            "success": result.success,
+            "error": result.error,
+            "gross": str(result.actual_gross) if result.actual_gross else None,
+            "net_per_share": str(result.actual_net_per_share) if result.actual_net_per_share else None,
+            "duration_ms": round(result.duration_ms, 2) if result.duration_ms else None,
+            "legs": legs_data,
+        }
+
+        try:
+            with Path("shadow_trades.jsonl").open("a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            log.warning("Could not write shadow record: %s", e)
