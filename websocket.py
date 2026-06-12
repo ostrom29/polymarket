@@ -268,8 +268,9 @@ def _load_pairs(preferred: str = "wc_pairs.json", fallback: str = "friendlies_pa
 
 
 def _setup_logging() -> None:
+    level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
         handlers=[
