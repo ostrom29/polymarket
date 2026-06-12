@@ -108,8 +108,10 @@ def main() -> None:
             pass
         print(f"  Raw API response        : {usdc}")
 
-        balance_raw = usdc.get("balance", usdc.get("USDC", {}).get("balance", 0) if isinstance(usdc.get("USDC"), dict) else 0)
-        allowance_raw = usdc.get("allowance", usdc.get("USDC", {}).get("allowance", 0) if isinstance(usdc.get("USDC"), dict) else 0)
+        balance_raw = usdc.get("balance", 0)
+        # "allowances" is a dict of {contract_address: amount} — take max across all contracts
+        allowances_dict = usdc.get("allowances", {})
+        allowance_raw = max((float(v) for v in allowances_dict.values()), default=0) if allowances_dict else 0
 
         print(f"  USDC balance on Polygon : {balance_raw} USDC")
         print(f"  Current CTF allowance   : {allowance_raw} USDC")

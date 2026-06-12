@@ -114,7 +114,10 @@ class ExecutionEngine:
                     self._usdc_balance,
                 )
 
-            allowance = Decimal(str(usdc.get("allowance", 0)))
+            # "allowances" is a dict of {contract: amount} — check the max across all CTF contracts
+            allowances_dict = usdc.get("allowances", {})
+            max_allowance = max((float(v) for v in allowances_dict.values()), default=0) if allowances_dict else 0
+            allowance = Decimal(str(max_allowance))
             if allowance < Decimal("1"):
                 raise RuntimeError(
                     f"USDC allowance is {allowance} — Polymarket CTF Exchange cannot spend "
