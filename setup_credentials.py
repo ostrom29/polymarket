@@ -97,8 +97,19 @@ def main() -> None:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         usdc = client.get_balance_allowance(params)
-        balance_raw = usdc.get("balance", 0)
-        allowance_raw = usdc.get("allowance", 0)
+
+        # Debug: print wallet address and raw response so mismatches are visible
+        try:
+            from eth_account import Account
+            pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+            address = Account.from_key(pk).address
+            print(f"  Wallet address          : {address}")
+        except Exception:
+            pass
+        print(f"  Raw API response        : {usdc}")
+
+        balance_raw = usdc.get("balance", usdc.get("USDC", {}).get("balance", 0) if isinstance(usdc.get("USDC"), dict) else 0)
+        allowance_raw = usdc.get("allowance", usdc.get("USDC", {}).get("allowance", 0) if isinstance(usdc.get("USDC"), dict) else 0)
 
         print(f"  USDC balance on Polygon : {balance_raw} USDC")
         print(f"  Current CTF allowance   : {allowance_raw} USDC")
