@@ -32,15 +32,15 @@ from .position_guard import PositionGuard, FilledLeg
 
 log = logging.getLogger(__name__)
 
-# Taker fee rate charged by Polymarket CLOB (per leg, per order)
+# Default taker fee rate — overridden per-pair by the actual feeRate from market data
 TAKER_FEE_RATE = Decimal("0.02")
 BREAKEVEN_GROSS = Decimal("1") / (Decimal("1") + TAKER_FEE_RATE)  # ≈ 0.9804
 
 # How long to wait for a fill confirmation from the CLOB
 FILL_TIMEOUT_S = 5.0
 
-# Re-check: if actual order prices shift the gross above this, abort silently
-MAX_GROSS_AT_EXECUTION = BREAKEVEN_GROSS - Decimal("0.005")  # 0.5% safety margin
+# Safety margin subtracted from breakeven before execution check
+EXECUTION_SAFETY_MARGIN = Decimal("0.005")
 
 
 @dataclass
@@ -101,8 +101,11 @@ class ExecutionEngine:
         (orders would revert on-chain).
         """
         try:
-            balance_raw = self._client.get_usdc_balance()
-            self._usdc_balance = Decimal(str(balance_raw))
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            usdc = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            self._usdc_balance = Decimal(str(usdc.get("balance", 0)))
             log.info("USDC balance on Polygon: %s USDC", self._usdc_balance)
 
             if self._usdc_balance < Decimal("10"):
@@ -111,8 +114,7 @@ class ExecutionEngine:
                     self._usdc_balance,
                 )
 
-            allowance_raw = self._client.get_usdc_allowance()
-            allowance = Decimal(str(allowance_raw))
+            allowance = Decimal(str(usdc.get("allowance", 0)))
             if allowance < Decimal("1"):
                 raise RuntimeError(
                     f"USDC allowance is {allowance} — Polymarket CTF Exchange cannot spend "
@@ -134,6 +136,7 @@ class ExecutionEngine:
         tokens: list[str],
         books: dict,          # token_id → LiveOrderBook (live reference)
         target_shares: int,
+        fee_rate: Optional[Decimal] = None,  # actual rate from market data; falls back to TAKER_FEE_RATE
     ) -> ExecutionResult:
         """
         Entry point called from the WebSocket event loop via asyncio.create_task().
@@ -149,7 +152,7 @@ class ExecutionEngine:
         self._active.add(pair_id)
         t0 = time.perf_counter()
         try:
-            result = await self._run(pair_id, strategy, tokens, books, target_shares)
+            result = await self._run(pair_id, strategy, tokens, books, target_shares, fee_rate)
         except Exception as exc:
             log.exception("Unexpected error executing %s", pair_id)
             result = ExecutionResult(
@@ -172,7 +175,12 @@ class ExecutionEngine:
         tokens: list[str],
         books: dict,
         target_shares: int,
+        fee_rate: Optional[Decimal] = None,
     ) -> ExecutionResult:
+        effective_fee = fee_rate if fee_rate is not None else TAKER_FEE_RATE
+        effective_breakeven = Decimal("1") / (Decimal("1") + effective_fee)
+        effective_max_gross = effective_breakeven - EXECUTION_SAFETY_MARGIN
+
         result = ExecutionResult(
             success=False, pair_id=pair_id, strategy=strategy, shadow=self.shadow_mode
         )
@@ -188,8 +196,12 @@ class ExecutionEngine:
                         specs_preview.append(spec)
             if specs_preview:
                 required = sum(s.expected_cost for s in specs_preview)
-                balance = await asyncio.to_thread(self._client.get_usdc_balance)
-                available = Decimal(str(balance))
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                usdc = await asyncio.to_thread(
+                    self._client.get_balance_allowance,
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+                )
+                available = Decimal(str(usdc.get("balance", 0)))
                 if available < required:
                     result.error = f"insufficient_balance:{available:.2f}<{required:.2f}"
                     log.warning("Skipping %s — need %s USDC, have %s", pair_id, required, available)
@@ -213,10 +225,10 @@ class ExecutionEngine:
 
         # Step 2: Re-verify profitability at actual execution prices
         actual_gross = sum(s.expected_vwap for s in specs)
-        if actual_gross >= MAX_GROSS_AT_EXECUTION:
-            result.error = f"price_moved:{actual_gross:.4f}>={MAX_GROSS_AT_EXECUTION:.4f}"
+        if actual_gross >= effective_max_gross:
+            result.error = f"price_moved:{actual_gross:.4f}>={effective_max_gross:.4f}"
             log.debug("Aborting %s — price moved to %.4f (threshold %.4f)",
-                      pair_id, actual_gross, MAX_GROSS_AT_EXECUTION)
+                      pair_id, actual_gross, effective_max_gross)
             return result
 
         result.actual_gross = actual_gross
@@ -253,7 +265,7 @@ class ExecutionEngine:
         # All legs filled
         actual_fills = [lr.filled for lr in leg_results]
         actual_gross_filled = sum(f.avg_fill_price for f in actual_fills)  # type: ignore
-        fee_per_share = actual_gross_filled * TAKER_FEE_RATE
+        fee_per_share = actual_gross_filled * effective_fee
         net_per_share = Decimal("1") - actual_gross_filled - fee_per_share
 
         result.success = True

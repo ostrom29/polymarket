@@ -33,6 +33,7 @@ class OpportunityWindow:
     target_shares: Decimal
     opened_at_iso: str
     _perf_open: float
+    fee_rate: Decimal = field(default_factory=lambda: TAKER_FEE_RATE)
     ticks: int = 1
     peak_net_profit: Decimal = field(default_factory=lambda: Decimal("0"))
     duration_ms: Optional[float] = None
@@ -69,6 +70,7 @@ class PaperTrader:
         label: str,
         vwaps: list[Optional[float]],
         total_cost: Optional[float],
+        fee_rate: Optional[Decimal] = None,
     ) -> None:
         if total_cost is None:
             if pair_id in self._active:
@@ -76,12 +78,13 @@ class PaperTrader:
             return
 
         gross_cost = Decimal(str(round(total_cost, 8)))
+        effective_fee = fee_rate if fee_rate is not None else TAKER_FEE_RATE
 
         if gross_cost < Decimal("1"):
             self.n_gross_signals += 1
             self._inc_strategy(strategy, "gross")
 
-        fee_cost = gross_cost * TAKER_FEE_RATE
+        fee_cost = gross_cost * effective_fee
         net_profit_per_share = Decimal("1") - gross_cost - fee_cost
 
         if net_profit_per_share > 0:
@@ -102,6 +105,7 @@ class PaperTrader:
                     target_shares=self.target_shares,
                     opened_at_iso=datetime.now(timezone.utc).isoformat(),
                     _perf_open=time.perf_counter(),
+                    fee_rate=effective_fee,
                     peak_net_profit=net_profit_per_share,
                     vwaps_open=vwaps_str,
                 )
@@ -126,7 +130,7 @@ class PaperTrader:
         window.duration_ms = (now - window._perf_open) * 1000
         self._closed.append(window)
         gross_cost = window.gross_cost_open
-        self._log_event("CLOSE", window, gross_cost, gross_cost * TAKER_FEE_RATE, reason=reason)
+        self._log_event("CLOSE", window, gross_cost, gross_cost * window.fee_rate, reason=reason)
         print(
             f"  ⏱  [{window.strategy:15}] {window.match_id[:30]:<30} | "
             f"{window.duration_ms:.0f}ms | {window.ticks} ticks | {reason}"
@@ -177,7 +181,8 @@ class PaperTrader:
         print(f"  │  Match    : {window.match_id}")
         print(f"  │  Legs     : {' + '.join(window.vwaps_open)}")
         print(f"  │  Gross    : {gross_cost:.4f} USDC  (threshold {BREAKEVEN_GROSS:.4f})")
-        print(f"  │  Fees 2%  : {fee_cost:.4f} USDC")
+        fee_pct = float(window.fee_rate) * 100
+        print(f"  │  Fees {fee_pct:.0f}%  : {fee_cost:.4f} USDC")
         print(f"  │  Net/shr  : +{window.net_profit_per_share:.4f} USDC")
         print(f"  │  Net tot  : +{window.net_profit_total:.4f} USDC  ({window.target_shares} sh)")
         print(f"  └─ Cumul.   : +{self.cumulative_profit:.4f} USDC\n")

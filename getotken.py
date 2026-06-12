@@ -13,6 +13,7 @@ import requests
 import json
 import re
 import time
+from decimal import Decimal
 from datetime import datetime, timezone
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
@@ -46,10 +47,11 @@ def _team_names_from_title(title: str) -> tuple[str, str]:
     return home, away
 
 
-def _scan_markets(markets: list, title: str) -> tuple[dict, str | None]:
+def _scan_markets(markets: list, title: str) -> tuple[dict, str | None, Decimal]:
     """
     Extract all relevant tokens from a list of sub-markets.
-    Returns (slots, game_start_time) where slots maps role → token_id (None if missing).
+    Returns (slots, game_start_time, fee_rate).
+    fee_rate is read from the first sub-market that has a feeRate field; defaults to 0.02.
     """
     home, away = _team_names_from_title(title)
 
@@ -67,11 +69,24 @@ def _scan_markets(markets: list, title: str) -> tuple[dict, str | None]:
         "away_yes": None,
     }
     game_start_time: str | None = None
+    fee_rate: Decimal | None = None
 
     for sm in markets:
         # Grab the first non-null gameStartTime we find
         if game_start_time is None and sm.get("gameStartTime"):
             game_start_time = sm["gameStartTime"]
+
+        # Read actual fee rate from the first sub-market that declares it
+        if fee_rate is None and sm.get("feeRate") is not None:
+            try:
+                fee = Decimal(str(sm["feeRate"]))
+                # Guard: if > 0.5 the API expressed it as a percentage (e.g. 2.0 → 0.02)
+                if fee > Decimal("0.5"):
+                    fee = fee / Decimal("100")
+                if Decimal("0") < fee <= Decimal("0.25"):  # valid range: 0–25%
+                    fee_rate = fee
+            except Exception:
+                pass
 
         sm_type = sm.get("sportsMarketType") or ""
         question = (sm.get("question") or "").lower()
@@ -116,7 +131,7 @@ def _scan_markets(markets: list, title: str) -> tuple[dict, str | None]:
                 if slots["away_yes"] is None:
                     slots["away_yes"] = yes_tok
 
-    return slots, game_start_time
+    return slots, game_start_time, fee_rate or Decimal("0.02")
 
 
 def _build_pairs(
@@ -125,6 +140,7 @@ def _build_pairs(
     slots: dict,
     volume24hr: float,
     game_start_time: str | None,
+    fee_rate: Decimal = Decimal("0.02"),
 ) -> list[dict]:
     """Assemble valid strategy pairs from extracted token slots."""
     pairs: list[dict] = []
@@ -140,6 +156,7 @@ def _build_pairs(
                 "label": label,
                 "volume24hr": volume24hr,
                 "game_start_time": game_start_time,
+                "fee_rate": float(fee_rate),
             })
 
     _add("btts_vs_o15", [slots["btts_no"], slots["o15_yes"]], "NO BTTS + YES O1.5")
@@ -211,8 +228,8 @@ def fetch_all_pairs(output_file: str = "wc_pairs.json") -> None:
             skipped_low_vol += 1
             continue
 
-        slots, game_start_time = _scan_markets(data["markets"], title)
-        pairs = _build_pairs(base_slug, title, slots, volume24hr, game_start_time)
+        slots, game_start_time, fee_rate = _scan_markets(data["markets"], title)
+        pairs = _build_pairs(base_slug, title, slots, volume24hr, game_start_time, fee_rate)
 
         if pairs:
             all_pairs.extend(pairs)

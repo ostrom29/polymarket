@@ -94,17 +94,20 @@ def main() -> None:
     print("spend USDC from your wallet. Without it, all orders will revert.\n")
 
     try:
-        balance_raw = client.get_usdc_balance()
-        print(f"  USDC balance on Polygon : {balance_raw} USDC")
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        usdc = client.get_balance_allowance(params)
+        balance_raw = usdc.get("balance", 0)
+        allowance_raw = usdc.get("allowance", 0)
 
-        allowance_raw = client.get_usdc_allowance()
+        print(f"  USDC balance on Polygon : {balance_raw} USDC")
         print(f"  Current CTF allowance   : {allowance_raw} USDC")
 
         if float(allowance_raw) < 1.0:
             ans = input("\n  Approve unlimited USDC allowance? (yes/no): ").strip().lower()
             if ans == "yes":
                 print("  ⏳ Sending approval transaction on Polygon...")
-                resp = client.update_usdc_allowance()
+                resp = client.update_balance_allowance(params)
                 print(f"  ✅ Approval confirmed: {resp}")
             else:
                 print("  ⚠️  Skipped — you must approve before placing live orders.")

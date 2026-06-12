@@ -7,7 +7,7 @@ from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 
 from arbitrage import PricingEngine, NLegDetector
-from paper_trader import PaperTrader, BREAKEVEN_GROSS
+from paper_trader import PaperTrader
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,12 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # 12h covers a full CdM match day without locking capital on tomorrow's games.
 TRADE_WINDOW_HOURS = 12
 TARGET_SHARES = 10
+
+# Re-scan Polymarket every N hours for new markets / closed matches
+PAIR_REFRESH_HOURS = 4
+
+# Signals the stream to reconnect with freshly fetched pairs
+_refresh_event = asyncio.Event()
 
 # Token → set of pair_ids that include it (reverse index for fast lookup on price update)
 TokenIndex = dict[str, set[str]]
@@ -55,6 +61,7 @@ class OrderBookManager:
         self.paper_trader = paper_trader
         self.executor = executor
         self._token_index: TokenIndex = {}  # token_id → {pair_id, ...}
+        self._fee_rates: dict[str, Decimal] = {}  # pair_id → actual fee rate from market data
 
     def register_pair(self, pair: dict) -> None:
         """Add a pair to the detector and build the reverse token index."""
@@ -64,6 +71,7 @@ class OrderBookManager:
             label=pair["label"],
             strategy=pair["strategy"],
         )
+        self._fee_rates[pair["pair_id"]] = Decimal(str(pair.get("fee_rate", "0.02")))
         for token in pair["tokens"]:
             self._token_index.setdefault(token, set()).add(pair["pair_id"])
 
@@ -71,6 +79,9 @@ class OrderBookManager:
         for pair_id in self._token_index.get(asset_id, set()):
             vwaps, total_cost = self.detector.check(pair_id, self.books)
             pair = self.detector.pairs[pair_id]
+
+            fee_rate = self._fee_rates.get(pair_id, Decimal("0.02"))
+            breakeven = Decimal("1") / (Decimal("1") + fee_rate)
 
             if self.paper_trader:
                 self.paper_trader.on_tick(
@@ -80,13 +91,14 @@ class OrderBookManager:
                     label=pair["label"],
                     vwaps=vwaps,
                     total_cost=total_cost,
+                    fee_rate=fee_rate,
                 )
 
-            # Fire execution only when the signal is net-profitable after fees
+            # Fire execution only when the signal is net-profitable after actual fees
             if (
                 self.executor is not None
                 and total_cost is not None
-                and Decimal(str(round(total_cost, 8))) < BREAKEVEN_GROSS
+                and Decimal(str(round(total_cost, 8))) < breakeven
             ):
                 asyncio.create_task(
                     self.executor.execute(
@@ -95,6 +107,7 @@ class OrderBookManager:
                         tokens=pair["tokens"],
                         books=self.books,
                         target_shares=TARGET_SHARES,
+                        fee_rate=fee_rate,
                     )
                 )
 
@@ -126,33 +139,75 @@ class OrderBookManager:
                 self._evaluate_pairs(asset_id)
 
 
-async def stream_market_data(token_ids: list[str], manager: OrderBookManager) -> None:
-    subscribe_msg = {
-        "type": "subscribe",
-        "channels": ["market"],
-        "assets_ids": token_ids,
-    }
-
+async def _refresh_loop(pairs_file: str = "wc_pairs.json") -> None:
+    """
+    Background task: re-fetch market pairs every PAIR_REFRESH_HOURS hours.
+    Sets _refresh_event to trigger a WebSocket reconnect with updated pairs.
+    """
     while True:
-        print(f"\n🔌 Connecting to Polymarket CLOB Stream ({len(token_ids)} tokens)...")
+        await asyncio.sleep(PAIR_REFRESH_HOURS * 3600)
+        log.info("Scheduled pair refresh — re-scanning Polymarket (every %dh)...", PAIR_REFRESH_HOURS)
+        try:
+            from getotken import fetch_all_pairs
+            await asyncio.to_thread(fetch_all_pairs, pairs_file)
+            _refresh_event.set()
+            log.info("Pairs refreshed — stream will reconnect with updated tokens")
+        except Exception as e:
+            log.warning("Pair refresh failed: %s", e)
+
+
+async def stream_market_data(
+    executor,
+    paper_trader: PaperTrader | None,
+    pairs_file: str = "wc_pairs.json",
+) -> None:
+    """
+    Main stream loop. Reloads pairs from disk on every reconnect so that a scheduled
+    pair refresh (via _refresh_loop) automatically takes effect on the next connection.
+    """
+    while True:
+        _refresh_event.clear()
+        pairs, tokens = _load_pairs(pairs_file)
+
+        if not tokens:
+            log.warning("No tokens to subscribe to — retrying in 30s")
+            await asyncio.sleep(30)
+            continue
+
+        # Fresh manager per connection so pair/book state is always consistent
+        manager = OrderBookManager(paper_trader=paper_trader, executor=executor)
+        for p in pairs:
+            manager.register_pair(p)
+
+        subscribe_msg = {
+            "type": "subscribe",
+            "channels": ["market"],
+            "assets_ids": tokens,
+        }
+
+        log.info("Connecting to CLOB Stream (%d tokens, %d pairs)...", len(tokens), len(pairs))
         try:
             async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps(subscribe_msg))
-                print("✅ Subscribed. Awaiting stream...\n")
+                log.info("Subscribed. Awaiting stream...")
 
-                for t_id in token_ids:
-                    if t_id not in manager.books:
-                        manager.books[t_id] = LiveOrderBook(t_id)
+                for t_id in tokens:
+                    manager.books[t_id] = LiveOrderBook(t_id)
 
-                while True:
-                    message = await ws.recv()
-                    manager.process_message(message)
+                while not _refresh_event.is_set():
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        manager.process_message(message)
+                    except asyncio.TimeoutError:
+                        pass  # check _refresh_event and loop
+
+                log.info("Pair refresh detected — reconnecting with updated pairs")
 
         except websockets.exceptions.ConnectionClosed:
-            print("❌ Connection closed. Reconnecting in 5s...")
+            log.warning("Connection closed — reconnecting in 5s...")
             await asyncio.sleep(5)
         except Exception as e:
-            print(f"⚠️  Network error: {e}. Reconnecting in 5s...")
+            log.warning("Network error: %s — reconnecting in 5s...", e)
             await asyncio.sleep(5)
 
 
@@ -241,19 +296,15 @@ if __name__ == "__main__":
     _load_env()
     _setup_logging()
 
-    pairs, tokens = _load_pairs()
+    PAIRS_FILE = "wc_pairs.json"
 
-    if not pairs:
-        print("[!] No pairs file found. Run getotken.py first.")
-        exit(1)
-
-    # Strategy breakdown
-    by_strat: dict[str, int] = {}
-    for p in pairs:
-        s = p.get("strategy", "unknown")
-        by_strat[s] = by_strat.get(s, 0) + 1
-    for s, n in sorted(by_strat.items()):
-        print(f"   {s:20} : {n} pairs")
+    # Always fetch fresh pairs at startup — ensures we trade on current data
+    log.info("Fetching market pairs from Polymarket...")
+    try:
+        from getotken import fetch_all_pairs
+        fetch_all_pairs(PAIRS_FILE)
+    except Exception as e:
+        log.warning("Could not fetch fresh pairs (%s) — using cached file if available", e)
 
     # Execution engine — shadow mode unless explicitly disabled in .env
     shadow_mode = os.environ.get("SHADOW_MODE", "true").lower() != "false"
@@ -261,27 +312,21 @@ if __name__ == "__main__":
     try:
         from execution.executor import ExecutionEngine
         executor = ExecutionEngine(shadow_mode=shadow_mode)
-        mode_label = "SHADOW" if shadow_mode else "⚡ LIVE"
-        print(f"\n🔧 Execution engine: {mode_label}")
+        mode_label = "SHADOW" if shadow_mode else "LIVE"
+        log.info("Execution engine: %s", mode_label)
     except ImportError:
-        print("\n⚠️  execution/ module not found — running paper trading only")
+        log.warning("execution/ module not found — running paper trading only")
     except Exception as e:
-        print(f"\n⚠️  Executor init failed ({e}) — running paper trading only")
+        log.warning("Executor init failed (%s) — running paper trading only", e)
 
     paper = PaperTrader(target_shares=Decimal(str(TARGET_SHARES)), log_file="paper_trades.jsonl")
-    manager = OrderBookManager(paper_trader=paper, executor=executor)
 
-    for p in pairs:
-        manager.register_pair(p)
-
-    mode_str = "SHADOW execution" if (executor and shadow_mode) else \
-               "LIVE execution" if (executor and not shadow_mode) else \
-               "paper trading only"
-    print(f"\n📋 {mode_str} | {len(pairs)} pairs | {len(tokens)} tokens")
-    print(f"📁 Log: paper_trades.jsonl  |  execution.log\n")
+    async def _main() -> None:
+        asyncio.create_task(_refresh_loop(PAIRS_FILE))
+        await stream_market_data(executor, paper, PAIRS_FILE)
 
     try:
-        asyncio.run(stream_market_data(tokens, manager))
+        asyncio.run(_main())
     except KeyboardInterrupt:
         print("\n⏹  Stream stopped.")
         paper.print_summary()
