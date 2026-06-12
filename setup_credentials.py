@@ -88,8 +88,35 @@ def main() -> None:
     else:
         print("\n✅ .env already up to date")
 
+    # ── USDC approval ──────────────────────────────────────────────────────
+    print("\n─── USDC Approval ───\n")
+    print("Polymarket's CTF Exchange contract needs a one-time approval to")
+    print("spend USDC from your wallet. Without it, all orders will revert.\n")
+
+    try:
+        balance_raw = client.get_usdc_balance()
+        print(f"  USDC balance on Polygon : {balance_raw} USDC")
+
+        allowance_raw = client.get_usdc_allowance()
+        print(f"  Current CTF allowance   : {allowance_raw} USDC")
+
+        if float(allowance_raw) < 1.0:
+            ans = input("\n  Approve unlimited USDC allowance? (yes/no): ").strip().lower()
+            if ans == "yes":
+                print("  ⏳ Sending approval transaction on Polygon...")
+                resp = client.update_usdc_allowance()
+                print(f"  ✅ Approval confirmed: {resp}")
+            else:
+                print("  ⚠️  Skipped — you must approve before placing live orders.")
+        else:
+            print("  ✅ Allowance already set — no action needed.")
+
+    except Exception as e:
+        print(f"  ⚠️  Could not check USDC state: {e}")
+        print("     Make sure your wallet has MATIC for gas and USDC on Polygon.")
+
     print("\n─── Next steps ───")
-    print("  1. Verify SHADOW_MODE=false is set in .env when ready to go live")
+    print("  1. Set SHADOW_MODE=false in .env when ready to go live")
     print("  2. Run: python3 websocket.py")
     print()
 

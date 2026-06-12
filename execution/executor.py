@@ -84,13 +84,46 @@ class ExecutionEngine:
         self._client = None
         self._guard: Optional[PositionGuard] = None
         self._active: set[str] = set()
+        self._usdc_balance: Optional[Decimal] = None  # refreshed before each session
 
         if not shadow_mode:
             self._client = build_client(require_level2=True)
             self._guard = PositionGuard(self._client)
             log.info("ExecutionEngine — LIVE MODE (Level 2 auth)")
+            self._check_balance_and_approval()
         else:
-            log.info("ExecutionEngine — SHADOW MODE (orders signed, not submitted)")
+            log.info("ExecutionEngine — SHADOW MODE (no credentials required)")
+
+    def _check_balance_and_approval(self) -> None:
+        """
+        Fetch USDC balance and verify the CTF Exchange allowance on startup.
+        Logs a warning if balance is low; raises if allowance is zero
+        (orders would revert on-chain).
+        """
+        try:
+            balance_raw = self._client.get_usdc_balance()
+            self._usdc_balance = Decimal(str(balance_raw))
+            log.info("USDC balance on Polygon: %s USDC", self._usdc_balance)
+
+            if self._usdc_balance < Decimal("10"):
+                log.warning(
+                    "⚠️  Low USDC balance (%s). Consider depositing more before going live.",
+                    self._usdc_balance,
+                )
+
+            allowance_raw = self._client.get_usdc_allowance()
+            allowance = Decimal(str(allowance_raw))
+            if allowance < Decimal("1"):
+                raise RuntimeError(
+                    f"USDC allowance is {allowance} — Polymarket CTF Exchange cannot spend "
+                    "your USDC. Run setup_credentials.py to approve."
+                )
+            log.info("USDC allowance: %s USDC ✅", allowance)
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.warning("Could not verify USDC balance/allowance: %s", e)
 
     # ─── Public API ────────────────────────────────────────────────────────────
 
@@ -143,6 +176,24 @@ class ExecutionEngine:
         result = ExecutionResult(
             success=False, pair_id=pair_id, strategy=strategy, shadow=self.shadow_mode
         )
+
+        # Step 0: Verify we have enough USDC for all legs (live mode only)
+        if not self.shadow_mode:
+            specs_preview = []
+            for token_id in tokens:
+                book = books.get(token_id)
+                if book:
+                    spec = build_buy(token_id, target_shares, dict(book.asks))
+                    if spec:
+                        specs_preview.append(spec)
+            if specs_preview:
+                required = sum(s.expected_cost for s in specs_preview)
+                balance = await asyncio.to_thread(self._client.get_usdc_balance)
+                available = Decimal(str(balance))
+                if available < required:
+                    result.error = f"insufficient_balance:{available:.2f}<{required:.2f}"
+                    log.warning("Skipping %s — need %s USDC, have %s", pair_id, required, available)
+                    return result
 
         # Step 1: Build all order specs from current book snapshots
         specs: list[OrderSpec] = []
