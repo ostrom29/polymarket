@@ -14,9 +14,11 @@ log = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Only watch matches starting within this window (or already ongoing).
-# 12h covers a full CdM match day without locking capital on tomorrow's games.
+# Upcoming matches: watch up to TRADE_WINDOW_HOURS before kick-off.
 TRADE_WINDOW_HOURS = 12
+# Started/finished matches: watch up to POST_MATCH_HOURS after kick-off.
+# Covers 90min match + extra time + oracle resolution delay (~2-8h after final whistle).
+POST_MATCH_HOURS = 18
 TARGET_SHARES = 10
 
 # Re-scan Polymarket every N hours for new markets / closed matches
@@ -194,11 +196,12 @@ def _build_connect_message(mode: str, balance_str: str, pairs: list) -> str:
                 time_tag = dt.strftime("%H:%M")
                 date_tag = dt.strftime("%Y-%m-%d")
                 day_label = "" if date_tag == today_str else f" ({dt.strftime('%d/%m')})"
-                lines.append(f"  {time_tag}{day_label} — {title}")
+                icon = "🏁" if dt <= now_utc else "⏰"
+                lines.append(f"  {icon} {time_tag}{day_label} — {title}")
             except Exception:
-                lines.append(f"  ? — {title}")
+                lines.append(f"  ⏰ ? — {title}")
         else:
-            lines.append(f"  — {title}")
+            lines.append(f"  ⏰ — {title}")
 
     return "\n".join(lines)
 
@@ -297,14 +300,25 @@ async def stream_market_data(
 
 
 def _is_in_trade_window(game_start_time: str | None) -> bool:
-    """Return True if the match is ongoing or starts within TRADE_WINDOW_HOURS."""
+    """
+    True if the match is worth watching.
+
+    Upcoming  → kick-off within the next TRADE_WINDOW_HOURS (12h).
+    Started   → kick-off within the last POST_MATCH_HOURS (18h).
+                Covers the oracle resolution window where the winning token
+                can still trade at a discount before Polymarket settles.
+    """
     if not game_start_time:
         return True  # no time info → don't filter
     try:
         gst = datetime.fromisoformat(game_start_time.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
-        # Keep if: match started less than 2h ago (ongoing) OR starts within window
-        return (now - timedelta(hours=2)) <= gst <= (now + timedelta(hours=TRADE_WINDOW_HOURS))
+        if gst <= now:
+            # Match already started: keep for POST_MATCH_HOURS after kick-off
+            return (now - gst) <= timedelta(hours=POST_MATCH_HOURS)
+        else:
+            # Upcoming match: keep if within TRADE_WINDOW_HOURS
+            return (gst - now) <= timedelta(hours=TRADE_WINDOW_HOURS)
     except Exception:
         return True  # can't parse → don't filter
 
