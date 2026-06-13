@@ -206,16 +206,72 @@ def _build_connect_message(mode: str, balance_str: str, pairs: list) -> str:
     return "\n".join(lines)
 
 
+def _positions_summary() -> str:
+    """Read positions.jsonl and return an open/closed P&L summary string."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    path = _Path("positions.jsonl")
+    if not path.exists():
+        return ""
+
+    now = datetime.now(timezone.utc)
+    open_pos, closed_net, closed_count = [], 0.0, 0
+
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = _json.loads(line)
+        except Exception:
+            continue
+
+        resolved = False
+        ra = rec.get("resolved_after", "")
+        if ra:
+            try:
+                resolved = now > datetime.fromisoformat(ra)
+            except Exception:
+                pass
+
+        if resolved:
+            closed_net += rec.get("est_net_pusd", 0)
+            closed_count += 1
+        else:
+            open_pos.append(rec)
+
+    if not open_pos and closed_count == 0:
+        return ""
+
+    lines = []
+    if open_pos:
+        locked = sum(r.get("cost_pusd", 0) for r in open_pos)
+        expected = sum(r.get("est_net_pusd", 0) for r in open_pos)
+        lines.append(f"Positions ouvertes : {len(open_pos)} ({locked:.2f} pUSD bloqués)")
+        for r in open_pos[-3:]:
+            title = r.get("title") or r.get("pair_id", "?").split("::")[0]
+            lines.append(f"  ⏳ {title} — +{r.get('est_net_pusd', 0):.3f} pUSD attendu")
+        lines.append(f"P&L en attente : +{expected:.3f} pUSD")
+
+    if closed_count > 0:
+        lines.append(f"P&L réalisé (estimé) : +{closed_net:.3f} pUSD sur {closed_count} trades")
+
+    return "\n".join(lines)
+
+
 async def _heartbeat_loop() -> None:
     """Send a Telegram status ping every HEARTBEAT_HOURS hours."""
     while True:
         await asyncio.sleep(HEARTBEAT_HOURS * 3600)
-        notify.send(
+        positions = _positions_summary()
+        msg = (
             f"💓 Bot actif\n"
             f"Ticks reçus : {_stats['ticks']:,}\n"
-            f"Opportunités évaluées : {_stats['opportunities']}\n"
-            f"Trades déclenchés : {notify.trades_fired}"
+            f"Opportunités : {_stats['opportunities']} | Trades : {notify.trades_fired}"
         )
+        if positions:
+            msg += f"\n\n{positions}"
+        notify.send(msg)
 
 
 async def _refresh_loop(pairs_file: str = "wc_pairs.json") -> None:

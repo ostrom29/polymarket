@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -420,6 +420,8 @@ class ExecutionEngine:
 
         if result.shadow:
             self._write_shadow_record(result)
+        elif result.success:
+            self._write_position(result)
 
         if result.success:
             notify.trades_fired += 1
@@ -453,6 +455,41 @@ class ExecutionEngine:
                 f"Net total : +{net_total:.3f} pUSD\n"
                 f"Durée : {result.duration_ms:.0f}ms"
             )
+
+    def _write_position(self, result: ExecutionResult) -> None:
+        """Append a live trade to positions.jsonl for P&L tracking."""
+        shares_per_leg = result.legs[0].filled.filled_size if result.legs and result.legs[0].filled else 0
+        cost_pusd = float(result.actual_gross) * shares_per_leg
+        est_net_pusd = float(result.actual_net_per_share) * shares_per_leg
+
+        # Heuristic: oracle typically resolves within 6h of kick-off
+        resolved_after = ""
+        if result.game_start_time:
+            try:
+                gst = datetime.fromisoformat(
+                    result.game_start_time.replace("+00", "+00:00")
+                )
+                resolved_after = (gst + timedelta(hours=6)).isoformat()
+            except Exception:
+                pass
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "pair_id": result.pair_id,
+            "title": result.title or result.pair_id.split("::")[0],
+            "game_start_time": result.game_start_time,
+            "strategy": result.strategy,
+            "shares_per_leg": shares_per_leg,
+            "n_legs": len(result.legs),
+            "cost_pusd": round(cost_pusd, 4),
+            "est_net_pusd": round(est_net_pusd, 4),
+            "resolved_after": resolved_after,
+        }
+        try:
+            with Path("positions.jsonl").open("a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            log.warning("Could not write position record: %s", e)
 
     def _write_shadow_record(self, result: ExecutionResult) -> None:
         legs_data = []
