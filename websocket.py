@@ -160,6 +160,49 @@ class OrderBookManager:
                 self._evaluate_pairs(asset_id)
 
 
+def _build_connect_message(mode: str, balance_str: str, pairs: list) -> str:
+    """Build the Telegram startup message listing watched matches."""
+    # Deduplicate by match_id, keep title + kick-off
+    seen: dict[str, dict] = {}
+    for p in pairs:
+        mid = p.get("match_id") or p["pair_id"].split("::")[0]
+        if mid not in seen:
+            seen[mid] = {
+                "title": p.get("title", mid),
+                "gst": p.get("game_start_time") or "",
+            }
+
+    # Sort by kick-off time
+    def _sort_key(item):
+        gst = item[1]["gst"]
+        if not gst:
+            return "9999"
+        return gst
+
+    matches = sorted(seen.items(), key=_sort_key)
+
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_utc.strftime("%Y-%m-%d")
+
+    lines = [f"🤖 Bot connecté — {mode}", f"{balance_str}{len(matches)} matchs surveillés", ""]
+    for _, info in matches:
+        title = info["title"]
+        gst = info["gst"]
+        if gst:
+            try:
+                dt = datetime.fromisoformat(gst.replace("Z", "+00:00")).astimezone(timezone.utc)
+                time_tag = dt.strftime("%H:%M")
+                date_tag = dt.strftime("%Y-%m-%d")
+                day_label = "" if date_tag == today_str else f" ({dt.strftime('%d/%m')})"
+                lines.append(f"  {time_tag}{day_label} — {title}")
+            except Exception:
+                lines.append(f"  ? — {title}")
+        else:
+            lines.append(f"  — {title}")
+
+    return "\n".join(lines)
+
+
 async def _heartbeat_loop() -> None:
     """Send a Telegram status ping every HEARTBEAT_HOURS hours."""
     while True:
@@ -227,10 +270,10 @@ async def stream_market_data(
                 import time as _time
                 if _time.time() - _last_connect_notify > _CONNECT_NOTIFY_MIN_INTERVAL:
                     mode = "SHADOW" if (executor and executor.shadow_mode) else "LIVE"
-                    notify.send(
-                        f"🤖 Bot connecté ({mode})\n"
-                        f"Pairs : {len(pairs)} | Tokens : {len(tokens)}"
-                    )
+                    balance_str = ""
+                    if executor and not executor.shadow_mode and executor._usdc_balance is not None:
+                        balance_str = f"{float(executor._usdc_balance):.2f} pUSD — "
+                    notify.send(_build_connect_message(mode, balance_str, pairs))
                     _last_connect_notify = _time.time()
 
                 for t_id in tokens:
