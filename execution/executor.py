@@ -276,34 +276,40 @@ class ExecutionEngine:
 
         result.actual_gross = actual_gross
 
-        # Step 3: Execute legs sequentially
-        filled_legs: list[FilledLeg] = []
-        leg_results: list[LegResult] = []
+        # Step 3: Execute all legs in parallel — same book snapshot for all legs,
+        # ~3× faster than sequential (max latency instead of sum of latencies).
+        if self.shadow_mode:
+            leg_results = [
+                LegResult(token_id=tid, spec=spec, filled=FilledLeg(
+                    token_id=tid, filled_size=spec.size,
+                    avg_fill_price=spec.expected_vwap, order_id="shadow",
+                ))
+                for tid, spec in zip(tokens, specs)
+            ]
+            filled_legs = [lr.filled for lr in leg_results]  # type: ignore[misc]
+        else:
+            outcomes = await asyncio.gather(
+                *[self._submit_leg(spec, pair_id, i) for i, spec in enumerate(specs)],
+                return_exceptions=True,
+            )
+            leg_results = []
+            filled_legs = []
+            for tid, spec, outcome in zip(tokens, specs, outcomes):
+                leg_r = LegResult(token_id=tid, spec=spec)
+                if isinstance(outcome, FilledLeg):
+                    leg_r.filled = outcome
+                    filled_legs.append(outcome)
+                else:
+                    leg_r.error = str(outcome) if isinstance(outcome, Exception) else "fill_failed"
+                leg_results.append(leg_r)
 
-        for i, (token_id, spec) in enumerate(zip(tokens, specs)):
-            leg_r = LegResult(token_id=token_id, spec=spec)
-
-            if self.shadow_mode:
-                leg_r.filled = FilledLeg(
-                    token_id=token_id,
-                    filled_size=spec.size,
-                    avg_fill_price=spec.expected_vwap,
-                    order_id="shadow",
-                )
-            else:
-                filled = await self._submit_leg(spec, pair_id, leg_index=i)
-                if filled is None:
-                    leg_r.error = "fill_failed"
-                    leg_results.append(leg_r)
-                    # Emergency exit: sell back everything already filled
-                    await self._abort(filled_legs, pair_id, books)
-                    result.legs = leg_results
-                    result.error = f"leg_{i}_failed"
-                    return result
-                leg_r.filled = filled
-                filled_legs.append(filled)
-
-            leg_results.append(leg_r)
+            if len(filled_legs) < len(specs):
+                # At least one leg didn't fill — sell back what did
+                await self._abort(filled_legs, pair_id, books)
+                n_ok = len(filled_legs)
+                result.legs = leg_results
+                result.error = f"partial_fill:{n_ok}/{len(specs)}_legs"
+                return result
 
         # All legs filled
         actual_fills = [lr.filled for lr in leg_results]
