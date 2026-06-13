@@ -124,7 +124,7 @@ class OrderBookManager:
                         strategy=pair["strategy"],
                         tokens=pair["tokens"],
                         books=self.books,
-                        target_shares=TARGET_SHARES,
+                        estimated_gross=float(total_cost),
                         fee_rate=fee_rate,
                         title=pair.get("title", ""),
                         game_start_time=pair.get("game_start_time", ""),

@@ -46,6 +46,15 @@ FILL_TIMEOUT_S = 5.0
 # Safety margin subtracted from breakeven before execution check
 EXECUTION_SAFETY_MARGIN = Decimal("0.005")
 
+# Position sizing: fraction of available balance to risk per opportunity.
+# target_shares = clamp(floor(balance × fraction / gross), MIN, MAX)
+CAPITAL_FRACTION = Decimal(os.environ.get("CAPITAL_FRACTION", "0.20"))
+MIN_SHARES_PER_LEG = int(os.environ.get("MIN_SHARES_PER_LEG", "5"))
+MAX_SHARES_PER_LEG = int(os.environ.get("MAX_SHARES_PER_LEG", "50"))
+
+# pUSD has 6 decimal places; the CLOB API returns raw on-chain units.
+_PUSD_DECIMALS = Decimal("1_000_000")
+
 
 @dataclass
 class LegResult:
@@ -111,8 +120,9 @@ class ExecutionEngine:
             usdc = self._client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
-            self._usdc_balance = Decimal(str(usdc.get("balance", 0)))
-            log.info("USDC balance on Polygon: %s USDC", self._usdc_balance)
+            # API returns raw on-chain units (6 decimal places for pUSD)
+            self._usdc_balance = Decimal(str(usdc.get("balance", 0))) / _PUSD_DECIMALS
+            log.info("pUSD balance: %.4f pUSD", self._usdc_balance)
 
             if self._usdc_balance < Decimal("10"):
                 log.warning(
@@ -144,7 +154,7 @@ class ExecutionEngine:
         strategy: str,
         tokens: list[str],
         books: dict,          # token_id → LiveOrderBook (live reference)
-        target_shares: int,
+        estimated_gross: float = 1.0,  # sum of per-leg VWAPs (cost per 1-share set)
         fee_rate: Optional[Decimal] = None,  # actual rate from market data; falls back to TAKER_FEE_RATE
         title: str = "",
         game_start_time: str = "",
@@ -163,7 +173,9 @@ class ExecutionEngine:
         self._active.add(pair_id)
         t0 = time.perf_counter()
         try:
-            result = await self._run(pair_id, strategy, tokens, books, target_shares, fee_rate)
+            result = await self._run(
+                pair_id, strategy, tokens, books, estimated_gross, fee_rate
+            )
             result.title = title
             result.game_start_time = game_start_time
         except Exception as exc:
@@ -187,7 +199,7 @@ class ExecutionEngine:
         strategy: str,
         tokens: list[str],
         books: dict,
-        target_shares: int,
+        estimated_gross: float = 1.0,
         fee_rate: Optional[Decimal] = None,
     ) -> ExecutionResult:
         effective_fee = fee_rate if fee_rate is not None else TAKER_FEE_RATE
@@ -198,27 +210,32 @@ class ExecutionEngine:
             success=False, pair_id=pair_id, strategy=strategy, shadow=self.shadow_mode
         )
 
-        # Step 0: Verify we have enough USDC for all legs (live mode only)
+        # Step 0: Fetch balance and compute dynamic target_shares
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+
         if not self.shadow_mode:
-            specs_preview = []
-            for token_id in tokens:
-                book = books.get(token_id)
-                if book:
-                    spec = build_buy(token_id, target_shares, dict(book.asks))
-                    if spec:
-                        specs_preview.append(spec)
-            if specs_preview:
-                required = sum(s.expected_cost for s in specs_preview)
-                from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
-                usdc = await asyncio.to_thread(
-                    self._client.get_balance_allowance,
-                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
-                )
-                available = Decimal(str(usdc.get("balance", 0)))
-                if available < required:
-                    result.error = f"insufficient_balance:{available:.2f}<{required:.2f}"
-                    log.warning("Skipping %s — need %s USDC, have %s", pair_id, required, available)
-                    return result
+            usdc = await asyncio.to_thread(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            # API returns raw on-chain units (6 decimals for pUSD)
+            available_pUSD = Decimal(str(usdc.get("balance", 0))) / _PUSD_DECIMALS
+        else:
+            available_pUSD = self._usdc_balance or Decimal("48")  # shadow: use startup value
+
+        gross_est = Decimal(str(estimated_gross)) if estimated_gross > 0 else Decimal("1")
+        shares_from_fraction = int(available_pUSD * CAPITAL_FRACTION / gross_est)
+        target_shares = max(MIN_SHARES_PER_LEG, min(MAX_SHARES_PER_LEG, shares_from_fraction))
+
+        min_cost = Decimal(str(MIN_SHARES_PER_LEG)) * gross_est
+        if available_pUSD < min_cost:
+            result.error = f"insufficient_balance:{available_pUSD:.2f}<{min_cost:.2f}"
+            log.warning("Skipping %s — need %.2f pUSD for min %d shares, have %.2f",
+                        pair_id, min_cost, MIN_SHARES_PER_LEG, available_pUSD)
+            return result
+
+        log.debug("Sizing %s: balance=%.2f pUSD → %d shares/leg (gross_est=%.4f)",
+                  pair_id, available_pUSD, target_shares, estimated_gross)
 
         # Step 1: Build all order specs from current book snapshots
         specs: list[OrderSpec] = []
@@ -388,9 +405,9 @@ class ExecutionEngine:
         if result.success:
             notify.trades_fired += 1
             mode = "🔵 SHADOW" if result.shadow else "🟢 LIVE"
-            total_shares = sum(lr.filled.filled_size for lr in result.legs if lr.filled)
-            total_cost = float(result.actual_gross) * (total_shares / len(result.legs)) if result.legs else 0
-            net_total = float(result.actual_net_per_share) * (total_shares / len(result.legs)) if result.legs else 0
+            shares_per_leg = result.legs[0].filled.filled_size if result.legs and result.legs[0].filled else 0
+            total_cost = float(result.actual_gross) * shares_per_leg
+            net_total = float(result.actual_net_per_share) * shares_per_leg
 
             # Format match kick-off time (strip date, keep HH:MM UTC)
             kickoff = ""
@@ -410,7 +427,7 @@ class ExecutionEngine:
                 f"{mode} Trade exécuté ✅\n"
                 f"Match : {match_line}{time_line}\n"
                 f"Stratégie : {result.strategy}\n"
-                f"Parts : {total_shares // len(result.legs)} × {len(result.legs)} legs\n"
+                f"Parts : {shares_per_leg} × {len(result.legs)} legs\n"
                 f"Coût total : {total_cost:.2f} pUSD\n"
                 f"Gross : {float(result.actual_gross):.4f}\n"
                 f"Net/part : +{float(result.actual_net_per_share):.4f} pUSD\n"
