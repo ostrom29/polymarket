@@ -22,6 +22,16 @@ TARGET_SHARES = 10
 # Re-scan Polymarket every N hours for new markets / closed matches
 PAIR_REFRESH_HOURS = 4
 
+# Heartbeat interval in hours
+HEARTBEAT_HOURS = 2
+
+# Global stats counters
+_stats = {"ticks": 0, "opportunities": 0, "trades": 0}
+
+# Avoid spamming Telegram on rapid reconnects
+_last_connect_notify: float = 0.0
+_CONNECT_NOTIFY_MIN_INTERVAL = 1800  # seconds
+
 # Signals the stream to reconnect with freshly fetched pairs
 _refresh_event = asyncio.Event()
 
@@ -63,6 +73,7 @@ class OrderBookManager:
         self.executor = executor
         self._token_index: TokenIndex = {}  # token_id → {pair_id, ...}
         self._fee_rates: dict[str, Decimal] = {}  # pair_id → actual fee rate from market data
+        self._last_executed: dict[str, float] = {}  # pair_id → timestamp of last execution
 
     def register_pair(self, pair: dict) -> None:
         """Add a pair to the detector and build the reverse token index."""
@@ -101,6 +112,12 @@ class OrderBookManager:
                 and total_cost is not None
                 and Decimal(str(round(total_cost, 8))) < breakeven
             ):
+                import time as _t
+                last = self._last_executed.get(pair_id, 0.0)
+                if _t.time() - last < 300:  # 5 min cooldown per pair
+                    continue
+                self._last_executed[pair_id] = _t.time()
+                _stats["opportunities"] += 1
                 asyncio.create_task(
                     self.executor.execute(
                         pair_id=pair_id,
@@ -109,6 +126,8 @@ class OrderBookManager:
                         books=self.books,
                         target_shares=TARGET_SHARES,
                         fee_rate=fee_rate,
+                        title=pair.get("title", ""),
+                        game_start_time=pair.get("game_start_time", ""),
                     )
                 )
 
@@ -137,7 +156,20 @@ class OrderBookManager:
                 if not asset_id or asset_id not in self.books:
                     continue
                 self.books[asset_id].update_delta(change)
+                _stats["ticks"] += 1
                 self._evaluate_pairs(asset_id)
+
+
+async def _heartbeat_loop() -> None:
+    """Send a Telegram status ping every HEARTBEAT_HOURS hours."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_HOURS * 3600)
+        notify.send(
+            f"💓 Bot actif\n"
+            f"Ticks reçus : {_stats['ticks']:,}\n"
+            f"Opportunités évaluées : {_stats['opportunities']}\n"
+            f"Trades déclenchés : {notify.trades_fired}"
+        )
 
 
 async def _refresh_loop(pairs_file: str = "wc_pairs.json") -> None:
@@ -191,6 +223,15 @@ async def stream_market_data(
             async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps(subscribe_msg))
                 log.info("Subscribed. Awaiting stream...")
+                global _last_connect_notify
+                import time as _time
+                if _time.time() - _last_connect_notify > _CONNECT_NOTIFY_MIN_INTERVAL:
+                    mode = "SHADOW" if (executor and executor.shadow_mode) else "LIVE"
+                    notify.send(
+                        f"🤖 Bot connecté ({mode})\n"
+                        f"Pairs : {len(pairs)} | Tokens : {len(tokens)}"
+                    )
+                    _last_connect_notify = _time.time()
 
                 for t_id in tokens:
                     manager.books[t_id] = LiveOrderBook(t_id)
@@ -324,10 +365,10 @@ if __name__ == "__main__":
     paper = PaperTrader(target_shares=Decimal(str(TARGET_SHARES)), log_file="paper_trades.jsonl")
 
     mode_label = "SHADOW" if shadow_mode else "LIVE"
-    notify.send(f"🤖 Polymarket bot démarré ({mode_label})\nPairs actives : chargement en cours...")
 
     async def _main() -> None:
         asyncio.create_task(_refresh_loop(PAIRS_FILE))
+        asyncio.create_task(_heartbeat_loop())
         await stream_market_data(executor, paper, PAIRS_FILE)
 
     try:

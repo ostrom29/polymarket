@@ -71,7 +71,8 @@ class PositionGuard:
                 )
 
     async def _sell_leg(self, leg: FilledLeg, books: dict) -> None:
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2 import Side
 
         # Use best bid from live book as sell price; fall back to 0.01 floor.
         book = books.get(leg.token_id)

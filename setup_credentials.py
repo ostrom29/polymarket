@@ -94,7 +94,7 @@ def main() -> None:
     print("spend USDC from your wallet. Without it, all orders will revert.\n")
 
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         usdc = client.get_balance_allowance(params)
 

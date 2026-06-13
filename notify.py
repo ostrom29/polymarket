@@ -11,6 +11,8 @@ log = logging.getLogger(__name__)
 _TOKEN: str | None = None
 _CHAT_ID: str | None = None
 
+trades_fired: int = 0
+
 
 def _load() -> tuple[str | None, str | None]:
     global _TOKEN, _CHAT_ID

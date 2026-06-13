@@ -70,6 +70,8 @@ class ExecutionResult:
     actual_net_per_share: Optional[Decimal] = None
     error: Optional[str] = None
     duration_ms: Optional[float] = None
+    title: str = ""
+    game_start_time: str = ""
 
 
 class ExecutionEngine:
@@ -105,7 +107,7 @@ class ExecutionEngine:
         (orders would revert on-chain).
         """
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
             usdc = self._client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
@@ -144,6 +146,8 @@ class ExecutionEngine:
         books: dict,          # token_id → LiveOrderBook (live reference)
         target_shares: int,
         fee_rate: Optional[Decimal] = None,  # actual rate from market data; falls back to TAKER_FEE_RATE
+        title: str = "",
+        game_start_time: str = "",
     ) -> ExecutionResult:
         """
         Entry point called from the WebSocket event loop via asyncio.create_task().
@@ -160,6 +164,8 @@ class ExecutionEngine:
         t0 = time.perf_counter()
         try:
             result = await self._run(pair_id, strategy, tokens, books, target_shares, fee_rate)
+            result.title = title
+            result.game_start_time = game_start_time
         except Exception as exc:
             log.exception("Unexpected error executing %s", pair_id)
             result = ExecutionResult(
@@ -203,7 +209,7 @@ class ExecutionEngine:
                         specs_preview.append(spec)
             if specs_preview:
                 required = sum(s.expected_cost for s in specs_preview)
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
                 usdc = await asyncio.to_thread(
                     self._client.get_balance_allowance,
                     BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
@@ -284,7 +290,8 @@ class ExecutionEngine:
     async def _submit_leg(
         self, spec: OrderSpec, pair_id: str, leg_index: int
     ) -> Optional[FilledLeg]:
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2 import Side
 
         for attempt in range(2):  # one retry on transient network error
             try:
@@ -379,12 +386,35 @@ class ExecutionEngine:
             self._write_shadow_record(result)
 
         if result.success:
+            notify.trades_fired += 1
             mode = "🔵 SHADOW" if result.shadow else "🟢 LIVE"
+            total_shares = sum(lr.filled.filled_size for lr in result.legs if lr.filled)
+            total_cost = float(result.actual_gross) * (total_shares / len(result.legs)) if result.legs else 0
+            net_total = float(result.actual_net_per_share) * (total_shares / len(result.legs)) if result.legs else 0
+
+            # Format match kick-off time (strip date, keep HH:MM UTC)
+            kickoff = ""
+            if result.game_start_time:
+                try:
+                    from datetime import datetime, timezone
+                    gst_str = result.game_start_time
+                    gst = datetime.fromisoformat(gst_str.replace("+00", "+00:00"))
+                    kickoff = gst.astimezone(timezone.utc).strftime("%H:%M UTC")
+                except Exception:
+                    kickoff = result.game_start_time
+
+            match_line = result.title or result.pair_id.split("::")[0]
+            time_line = f" — {kickoff}" if kickoff else ""
+
             notify.send(
                 f"{mode} Trade exécuté ✅\n"
+                f"Match : {match_line}{time_line}\n"
                 f"Stratégie : {result.strategy}\n"
+                f"Parts : {total_shares // len(result.legs)} × {len(result.legs)} legs\n"
+                f"Coût total : {total_cost:.2f} pUSD\n"
                 f"Gross : {float(result.actual_gross):.4f}\n"
-                f"Net/share : +{float(result.actual_net_per_share):.4f}\n"
+                f"Net/part : +{float(result.actual_net_per_share):.4f} pUSD\n"
+                f"Net total : +{net_total:.3f} pUSD\n"
                 f"Durée : {result.duration_ms:.0f}ms"
             )
 

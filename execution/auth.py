@@ -6,19 +6,23 @@ Two auth levels:
   Level 2 — private key + creds → place/cancel orders
 
 Required env vars for Level 2 (order placement):
-  POLYMARKET_PRIVATE_KEY   — EOA wallet private key (0x-prefixed)
-  POLYMARKET_API_KEY       — derived via setup_credentials.py
+  POLYMARKET_PRIVATE_KEY        — EOA wallet private key (0x-prefixed)
+  POLYMARKET_API_KEY            — derived via setup_credentials.py
   POLYMARKET_API_SECRET
   POLYMARKET_PASSPHRASE
+  POLYMARKET_DEPOSIT_WALLET     — V2 deposit wallet address (signature_type=3)
 
 Run setup_credentials.py once to generate and persist Level 2 credentials.
 """
 import os
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds
 
 CLOB_HOST = "https://clob.polymarket.com"
 POLYGON_CHAIN_ID = 137
+
+# Signature type 3 = POLY_1271 (ERC-1271 deposit wallet flow, required for V2 CLOB)
+_SIG_POLY_1271 = 3
 
 
 def build_client(require_level2: bool = True) -> ClobClient:
@@ -39,6 +43,7 @@ def build_client(require_level2: bool = True) -> ClobClient:
     api_key = os.environ.get("POLYMARKET_API_KEY", "").strip()
     api_secret = os.environ.get("POLYMARKET_API_SECRET", "").strip()
     passphrase = os.environ.get("POLYMARKET_PASSPHRASE", "").strip()
+    deposit_wallet = os.environ.get("POLYMARKET_DEPOSIT_WALLET", "").strip()
 
     has_creds = bool(api_key and api_secret and passphrase)
 
@@ -54,12 +59,23 @@ def build_client(require_level2: bool = True) -> ClobClient:
             api_secret=api_secret,
             api_passphrase=passphrase,
         )
+        if deposit_wallet:
+            # V2 CLOB requires POLY_1271 (signature_type=3) with a per-user deposit wallet.
+            # The deposit wallet is deployed by the Polymarket factory and holds pUSD.
+            return ClobClient(
+                host=CLOB_HOST,
+                key=pk,
+                chain_id=POLYGON_CHAIN_ID,
+                creds=creds,
+                signature_type=_SIG_POLY_1271,
+                funder=deposit_wallet,
+            )
         return ClobClient(
             host=CLOB_HOST,
             key=pk,
             chain_id=POLYGON_CHAIN_ID,
             creds=creds,
-            signature_type=0,  # EOA (non-hardware wallet)
+            signature_type=0,
         )
 
     # Level 1 only — enough for credential derivation

@@ -67,15 +67,20 @@ def build_approve_calldata(spender: str) -> str:
     return "0x095ea7b3" + padded_spender + padded_amount
 
 
-def send_approve(account, spender: str, nonce: int, gas_price: int) -> str:
+def send_approve(account, spender: str, nonce: int, base_fee: int) -> str:
+    data = build_approve_calldata(spender)
+    priority_fee = 30 * 10 ** 9  # 30 gwei tip — sufficient on Polygon
+    max_fee = base_fee * 2 + priority_fee
     tx = {
-        "nonce":    nonce,
-        "gasPrice": gas_price,
-        "gas":      65_000,
-        "to":       USDC_NATIVE,
-        "value":    0,
-        "data":     build_approve_calldata(spender),
-        "chainId":  POLYGON_CHAIN_ID,
+        "type":                 2,
+        "nonce":                nonce,
+        "maxFeePerGas":         max_fee,
+        "maxPriorityFeePerGas": priority_fee,
+        "gas":                  110_000,  # generous limit — actual cost ~73k
+        "to":                   USDC_NATIVE,
+        "value":                0,
+        "data":                 data,
+        "chainId":              POLYGON_CHAIN_ID,
     }
     signed = account.sign_transaction(tx)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
@@ -94,17 +99,17 @@ def main():
     account = Account.from_key(pk)
     wallet  = account.address
 
-    print(f"\n─── Native USDC Approval ───")
+    print(f"\n─── USDC.e Approval ───")
     print(f"  Wallet : {wallet}")
-    print(f"  Token  : {USDC_NATIVE} (native USDC)\n")
+    print(f"  Token  : {USDC_NATIVE} (USDC.e)\n")
 
     # Current nonce
     nonce = int(rpc("eth_getTransactionCount", [wallet, "latest"]), 16)
 
-    # Gas price — 2× current for fast inclusion on Polygon
-    base_gas = int(rpc("eth_gasPrice", []), 16)
-    gas_price = base_gas * 2
-    print(f"  Gas price : {base_gas/1e9:.1f} gwei (using {gas_price/1e9:.1f} gwei)\n")
+    # EIP-1559 fees
+    block = rpc("eth_getBlockByNumber", ["latest", False])
+    base_fee = int(block["baseFeePerGas"], 16)
+    print(f"  Base fee : {base_fee/1e9:.1f} gwei\n")
 
     sent = 0
     for label, contract in CTF_CONTRACTS:
@@ -115,7 +120,7 @@ def main():
 
         print(f"  ⏳  {label:<22} approving...", end="", flush=True)
         try:
-            tx_hash = send_approve(account, contract, nonce + sent, gas_price)
+            tx_hash = send_approve(account, contract, nonce + sent, base_fee)
             print(f" ✅  {tx_hash}")
             sent += 1
         except Exception as e:
