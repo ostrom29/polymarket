@@ -52,6 +52,11 @@ CAPITAL_FRACTION = Decimal(os.environ.get("CAPITAL_FRACTION", "0.20"))
 MIN_SHARES_PER_LEG = int(os.environ.get("MIN_SHARES_PER_LEG", "5"))
 MAX_SHARES_PER_LEG = int(os.environ.get("MAX_SHARES_PER_LEG", "50"))
 
+# Minimum net profit per execution. Filters out marginal trades where the
+# emergency-exit loss (if a leg fails) would exceed the expected gain.
+# At 10 shares, gross=0.9706 → net = 0.10 pUSD exactly.
+MIN_NET_PUSD = Decimal(os.environ.get("MIN_NET_PUSD", "0.10"))
+
 # pUSD has 6 decimal places; the CLOB API returns raw on-chain units.
 _PUSD_DECIMALS = Decimal("1_000_000")
 
@@ -234,8 +239,16 @@ class ExecutionEngine:
                         pair_id, min_cost, MIN_SHARES_PER_LEG, available_pUSD)
             return result
 
-        log.debug("Sizing %s: balance=%.2f pUSD → %d shares/leg (gross_est=%.4f)",
-                  pair_id, available_pUSD, target_shares, estimated_gross)
+        estimated_net_per_share = Decimal("1") - gross_est * (Decimal("1") + effective_fee)
+        estimated_net_total = estimated_net_per_share * Decimal(str(target_shares))
+        if estimated_net_total < MIN_NET_PUSD:
+            result.error = f"below_min_profit:{estimated_net_total:.3f}<{MIN_NET_PUSD}"
+            log.debug("Skipping %s — net %.3f pUSD < min %.3f (gross=%.4f, %d shares)",
+                      pair_id, estimated_net_total, MIN_NET_PUSD, estimated_gross, target_shares)
+            return result
+
+        log.info("Executing %s — gross=%.4f | %d shares/leg | est. net=+%.3f pUSD",
+                 pair_id, estimated_gross, target_shares, estimated_net_total)
 
         # Step 1: Build all order specs from current book snapshots
         specs: list[OrderSpec] = []
