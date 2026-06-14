@@ -115,7 +115,12 @@ class ExecutionEngine:
         self._guard: Optional[PositionGuard] = None
         self._active: set[str] = set()
         self._usdc_balance: Optional[Decimal] = None  # refreshed before each session
+        self._start_balance: Optional[Decimal] = None  # captured at startup for P&L
         self._pair_failures: dict[str, int] = {}  # pair_id → consecutive partial-fill count
+        self.stats = {
+            "success": 0, "partial_fill": 0, "skipped_phantom": 0,
+            "skipped_other": 0, "blacklisted_skips": 0,
+        }
 
         if not shadow_mode:
             self._client = build_client(require_level2=True)
@@ -138,6 +143,7 @@ class ExecutionEngine:
             )
             # API returns raw on-chain units (6 decimal places for pUSD)
             self._usdc_balance = Decimal(str(usdc.get("balance", 0))) / _PUSD_DECIMALS
+            self._start_balance = self._usdc_balance
             log.info("pUSD balance: %.4f pUSD", self._usdc_balance)
 
             if self._usdc_balance < Decimal("10"):
@@ -161,6 +167,21 @@ class ExecutionEngine:
             raise
         except Exception as e:
             log.warning("Could not verify USDC balance/allowance: %s", e)
+
+    async def fetch_balance(self) -> Optional[Decimal]:
+        """Fetch live pUSD balance, refresh the cache, and return it (None on shadow/error)."""
+        if self.shadow_mode or not self._client:
+            return self._usdc_balance
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            usdc = await asyncio.to_thread(
+                self._client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            self._usdc_balance = Decimal(str(usdc.get("balance", 0))) / _PUSD_DECIMALS
+        except Exception as e:
+            log.warning("Could not fetch live balance: %s", e)
+        return self._usdc_balance
 
     # ─── Public API ────────────────────────────────────────────────────────────
 
@@ -189,6 +210,7 @@ class ExecutionEngine:
         if self._pair_failures.get(pair_id, 0) >= MAX_PAIR_FAILURES:
             log.debug("Skipping %s — blacklisted after %d partial-fill failures",
                       pair_id, self._pair_failures[pair_id])
+            self.stats["blacklisted_skips"] += 1
             return ExecutionResult(
                 success=False, pair_id=pair_id, strategy=strategy,
                 shadow=self.shadow_mode, error="blacklisted",
@@ -212,16 +234,21 @@ class ExecutionEngine:
             self._active.discard(pair_id)
             result.duration_ms = (time.perf_counter() - t0) * 1000
 
-        # Track partial-fill failures (real money moved to spread) and blacklist
-        # repeat offenders so we stop hammering a structurally broken pair.
-        if result.error and result.error.startswith("partial_fill"):
+        # Categorize the outcome for the heartbeat and manage the per-pair blacklist.
+        if result.success:
+            self.stats["success"] += 1
+            self._pair_failures.pop(pair_id, None)
+        elif result.error and result.error.startswith("partial_fill"):
+            self.stats["partial_fill"] += 1
             self._pair_failures[pair_id] = self._pair_failures.get(pair_id, 0) + 1
             if self._pair_failures[pair_id] >= MAX_PAIR_FAILURES and not self.shadow_mode:
                 notify.send(
                     f"⛔ Paire blacklistée (session) après {MAX_PAIR_FAILURES} échecs partiels\n{pair_id}"
                 )
-        elif result.success:
-            self._pair_failures.pop(pair_id, None)
+        elif result.error and result.error.startswith("implausible_gross"):
+            self.stats["skipped_phantom"] += 1
+        else:
+            self.stats["skipped_other"] += 1
 
         self._log_result(result)
         return result
@@ -265,6 +292,7 @@ class ExecutionEngine:
             )
             # API returns raw on-chain units (6 decimals for pUSD)
             available_pUSD = Decimal(str(usdc.get("balance", 0))) / _PUSD_DECIMALS
+            self._usdc_balance = available_pUSD  # keep cache fresh for the heartbeat
         else:
             available_pUSD = self._usdc_balance or Decimal("48")  # shadow: use startup value
 

@@ -26,7 +26,7 @@ TARGET_SHARES = 10
 PAIR_REFRESH_HOURS = 4
 
 # Heartbeat interval in hours
-HEARTBEAT_HOURS = 2
+HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "1"))
 
 # Global stats counters
 _stats = {"ticks": 0, "opportunities": 0, "trades": 0}
@@ -260,19 +260,54 @@ def _positions_summary() -> str:
     return "\n".join(lines)
 
 
-async def _heartbeat_loop() -> None:
-    """Send a Telegram status ping every HEARTBEAT_HOURS hours."""
+async def _send_heartbeat(executor) -> None:
+    """Build and send a rich status ping: live balance, P&L, execution breakdown."""
+    mode = "SHADOW" if (executor and executor.shadow_mode) else "LIVE"
+
+    # Live balance + P&L since startup (fetched fresh, not the stale startup cache)
+    bal_line = ""
+    if executor and not executor.shadow_mode:
+        bal = await executor.fetch_balance()
+        start = getattr(executor, "_start_balance", None)
+        if bal is not None:
+            if start is not None:
+                pnl = float(bal) - float(start)
+                sign = "+" if pnl >= 0 else ""
+                bal_line = (
+                    f"Solde : {float(bal):.2f} pUSD "
+                    f"(départ {float(start):.2f} · P&L {sign}{pnl:.2f})\n"
+                )
+            else:
+                bal_line = f"Solde : {float(bal):.2f} pUSD\n"
+
+    s = getattr(executor, "stats", {}) if executor else {}
+    stuck = getattr(executor._guard, "stuck_count", 0) if (executor and getattr(executor, "_guard", None)) else 0
+
+    msg = (
+        f"💓 Bot actif — {mode}\n"
+        f"{bal_line}"
+        f"Ticks : {_stats['ticks']:,} | Signaux : {_stats['opportunities']}\n"
+        f"✅ Trades : {s.get('success', 0)}   ⚠️ Partiels : {s.get('partial_fill', 0)}\n"
+        f"🚫 Fantômes filtrés : {s.get('skipped_phantom', 0)}   "
+        f"⛔ Blacklist : {s.get('blacklisted_skips', 0)}"
+    )
+    if stuck:
+        msg += f"\n🔴 Positions bloquées (revente ratée) : {stuck}"
+
+    positions = _positions_summary()
+    if positions:
+        msg += f"\n\n{positions}"
+
+    notify.send(msg)
+
+
+async def _heartbeat_loop(executor) -> None:
+    """Send a Telegram status ping every HEARTBEAT_HOURS hours (plus one shortly after boot)."""
+    await asyncio.sleep(120)  # quick first heartbeat so the live balance shows up fast
+    await _send_heartbeat(executor)
     while True:
         await asyncio.sleep(HEARTBEAT_HOURS * 3600)
-        positions = _positions_summary()
-        msg = (
-            f"💓 Bot actif\n"
-            f"Ticks reçus : {_stats['ticks']:,}\n"
-            f"Opportunités : {_stats['opportunities']} | Trades : {notify.trades_fired}"
-        )
-        if positions:
-            msg += f"\n\n{positions}"
-        notify.send(msg)
+        await _send_heartbeat(executor)
 
 
 async def _refresh_loop(pairs_file: str = "wc_pairs.json") -> None:
@@ -482,7 +517,7 @@ if __name__ == "__main__":
 
     async def _main() -> None:
         asyncio.create_task(_refresh_loop(PAIRS_FILE))
-        asyncio.create_task(_heartbeat_loop())
+        asyncio.create_task(_heartbeat_loop(executor))
         await stream_market_data(executor, paper, PAIRS_FILE)
 
     try:

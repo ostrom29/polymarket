@@ -29,6 +29,7 @@ class FilledLeg:
 class PositionGuard:
     def __init__(self, client) -> None:
         self._client = client
+        self.stuck_count = 0  # emergency sells that failed → unhedged positions held
 
     async def emergency_exit(
         self,
@@ -58,6 +59,7 @@ class PositionGuard:
         for leg, result in zip(filled_legs, results):
             if isinstance(result, Exception):
                 # This is the worst possible failure — stuck position with no exit.
+                self.stuck_count += 1
                 log.critical(
                     "❌ EMERGENCY SELL FAILED — MANUAL INTERVENTION REQUIRED\n"
                     "  token   : %s\n"
@@ -74,10 +76,13 @@ class PositionGuard:
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
         from py_clob_client_v2 import Side
 
-        # Use best bid from live book as sell price; fall back to 0.01 floor.
+        # Cross a few ticks below best bid so the SELL fills as a taker immediately,
+        # even if the bid moved since the snapshot. Escaping an unhedged position
+        # fast is worth a little slippage; resting at the exact bid is how legs got
+        # stuck before (order sat 'live', never matched).
         book = books.get(leg.token_id)
         best_bid = max(book.bids.keys()) if (book and book.bids) else None
-        sell_price = float(best_bid) if best_bid else 0.01
+        sell_price = max(0.01, round(float(best_bid) - 0.03, 2)) if best_bid else 0.01
 
         order_args = OrderArgs(
             token_id=leg.token_id,
