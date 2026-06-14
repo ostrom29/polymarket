@@ -50,7 +50,10 @@ EXECUTION_SAFETY_MARGIN = Decimal("0.005")
 # target_shares = clamp(floor(balance × fraction / gross), MIN, MAX)
 CAPITAL_FRACTION = Decimal(os.environ.get("CAPITAL_FRACTION", "0.20"))
 MIN_SHARES_PER_LEG = int(os.environ.get("MIN_SHARES_PER_LEG", "5"))
-MAX_SHARES_PER_LEG = int(os.environ.get("MAX_SHARES_PER_LEG", "50"))
+# Probation cap: kept low (10) while we validate the post-incident fixes in live.
+# Once the heartbeat shows phantoms-filtered climbing and partial_fill staying 0,
+# raise it via the .env (MAX_SHARES_PER_LEG=50) — no redeploy needed.
+MAX_SHARES_PER_LEG = int(os.environ.get("MAX_SHARES_PER_LEG", "10"))
 
 # Minimum net profit per execution. Filters out marginal trades where the
 # emergency-exit loss (if a leg fails) would exceed the expected gain.
