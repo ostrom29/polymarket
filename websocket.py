@@ -16,9 +16,10 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # Upcoming matches: watch up to TRADE_WINDOW_HOURS before kick-off.
 TRADE_WINDOW_HOURS = 12
-# Started/finished matches: watch up to POST_MATCH_HOURS after kick-off.
-# Covers 90min match + extra time + oracle resolution delay (~2-8h after final whistle).
-POST_MATCH_HOURS = 18
+# Started matches: watch up to POST_MATCH_HOURS after kick-off (live play only).
+# Deliberately short: the post-match oracle-resolution window is where losing
+# outcomes collapse to 0.001 and create phantom arbs — we stay out of it.
+POST_MATCH_HOURS = int(os.environ.get("POST_MATCH_HOURS", "2"))
 TARGET_SHARES = 10
 
 # Re-scan Polymarket every N hours for new markets / closed matches

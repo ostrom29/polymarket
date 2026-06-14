@@ -16,6 +16,10 @@ from decimal import Decimal, ROUND_UP
 
 TICK_SIZE = Decimal("0.01")
 MAX_PRICE = Decimal("0.99")
+# Ask levels below this are ghost/dead liquidity (e.g. 0.001 on a resolved losing
+# outcome). The CLOB rejects orders under the 0.01 tick, so a 0.001 level would
+# build an order at an invalid price that fills no legs — the phantom-arb trap.
+MIN_PRICE = Decimal("0.02")
 
 
 @dataclass(frozen=True)
@@ -52,8 +56,14 @@ def build_buy(
     for price_f, size_f in levels:
         price = Decimal(str(price_f))
         size = Decimal(str(size_f))
-        worst_price = price
 
+        # Skip ghost/dead liquidity below the tradeable floor. Orders under the
+        # 0.01 tick are rejected by the CLOB; counting a 0.001 level would build
+        # an order at an invalid price that fills no legs (the phantom-arb trap).
+        if price < MIN_PRICE:
+            continue
+
+        worst_price = price
         needed = target - accumulated
         if size >= needed:
             total_cost += price * needed

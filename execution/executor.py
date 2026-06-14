@@ -54,8 +54,18 @@ MAX_SHARES_PER_LEG = int(os.environ.get("MAX_SHARES_PER_LEG", "50"))
 
 # Minimum net profit per execution. Filters out marginal trades where the
 # emergency-exit loss (if a leg fails) would exceed the expected gain.
-# At 10 shares, gross=0.9706 → net = 0.10 pUSD exactly.
+# We learned the hard way that emergency exits cost real money (spread bleed),
+# so this floor stays conservative.
 MIN_NET_PUSD = Decimal(os.environ.get("MIN_NET_PUSD", "0.10"))
+
+# Sanity floor on the detected gross. A legitimate inclusion arb sums to just
+# below 1.00; anything far under means the book is dead/thin (losing outcome
+# parked at 0.001) and the "arb" is a phantom we cannot fill. Skip before the API.
+SANITY_MIN_GROSS = Decimal(os.environ.get("SANITY_MIN_GROSS", "0.85"))
+
+# Stop hammering a pair that keeps failing to execute (partial fills = real money
+# lost to spread). After this many partial-fill failures, blacklist it this session.
+MAX_PAIR_FAILURES = int(os.environ.get("MAX_PAIR_FAILURES", "2"))
 
 # pUSD has 6 decimal places; the CLOB API returns raw on-chain units.
 _PUSD_DECIMALS = Decimal("1_000_000")
@@ -105,6 +115,7 @@ class ExecutionEngine:
         self._guard: Optional[PositionGuard] = None
         self._active: set[str] = set()
         self._usdc_balance: Optional[Decimal] = None  # refreshed before each session
+        self._pair_failures: dict[str, int] = {}  # pair_id → consecutive partial-fill count
 
         if not shadow_mode:
             self._client = build_client(require_level2=True)
@@ -175,6 +186,14 @@ class ExecutionEngine:
                 shadow=self.shadow_mode, error="already_active",
             )
 
+        if self._pair_failures.get(pair_id, 0) >= MAX_PAIR_FAILURES:
+            log.debug("Skipping %s — blacklisted after %d partial-fill failures",
+                      pair_id, self._pair_failures[pair_id])
+            return ExecutionResult(
+                success=False, pair_id=pair_id, strategy=strategy,
+                shadow=self.shadow_mode, error="blacklisted",
+            )
+
         self._active.add(pair_id)
         t0 = time.perf_counter()
         try:
@@ -192,6 +211,17 @@ class ExecutionEngine:
         finally:
             self._active.discard(pair_id)
             result.duration_ms = (time.perf_counter() - t0) * 1000
+
+        # Track partial-fill failures (real money moved to spread) and blacklist
+        # repeat offenders so we stop hammering a structurally broken pair.
+        if result.error and result.error.startswith("partial_fill"):
+            self._pair_failures[pair_id] = self._pair_failures.get(pair_id, 0) + 1
+            if self._pair_failures[pair_id] >= MAX_PAIR_FAILURES and not self.shadow_mode:
+                notify.send(
+                    f"⛔ Paire blacklistée (session) après {MAX_PAIR_FAILURES} échecs partiels\n{pair_id}"
+                )
+        elif result.success:
+            self._pair_failures.pop(pair_id, None)
 
         self._log_result(result)
         return result
@@ -215,6 +245,16 @@ class ExecutionEngine:
             success=False, pair_id=pair_id, strategy=strategy, shadow=self.shadow_mode
         )
 
+        # Sanity gate: reject implausibly-low gross (dead/thin-book phantom arb)
+        # before spending an API round-trip on it. A real inclusion arb sums to
+        # just below 1.00 — a gross of 0.60 means the book is broken/resolving.
+        gross_est = Decimal(str(estimated_gross)) if estimated_gross > 0 else Decimal("1")
+        if gross_est < SANITY_MIN_GROSS:
+            result.error = f"implausible_gross:{gross_est:.4f}<{SANITY_MIN_GROSS}"
+            log.warning("Skipping %s — implausible gross %.4f (dead/thin book?)",
+                        pair_id, gross_est)
+            return result
+
         # Step 0: Fetch balance and compute dynamic target_shares
         from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
@@ -228,7 +268,6 @@ class ExecutionEngine:
         else:
             available_pUSD = self._usdc_balance or Decimal("48")  # shadow: use startup value
 
-        gross_est = Decimal(str(estimated_gross)) if estimated_gross > 0 else Decimal("1")
         shares_from_fraction = int(available_pUSD * CAPITAL_FRACTION / gross_est)
         target_shares = max(MIN_SHARES_PER_LEG, min(MAX_SHARES_PER_LEG, shares_from_fraction))
 
@@ -454,6 +493,16 @@ class ExecutionEngine:
                 f"Net/part : +{float(result.actual_net_per_share):.4f} pUSD\n"
                 f"Net total : +{net_total:.3f} pUSD\n"
                 f"Durée : {result.duration_ms:.0f}ms"
+            )
+
+        elif result.error and result.error.startswith("partial_fill") and not result.shadow:
+            match_line = result.title or result.pair_id.split("::")[0]
+            notify.send(
+                f"⚠️ Exécution partielle — hedge incomplet\n"
+                f"Match : {match_line}\n"
+                f"Stratégie : {result.strategy}\n"
+                f"Détail : {result.error}\n"
+                f"→ Emergency exit déclenché (revente des legs remplis)"
             )
 
     def _write_position(self, result: ExecutionResult) -> None:

@@ -12,6 +12,12 @@ Strategy catalogue:
 """
 
 
+# Minimum ask price we treat as real, tradeable liquidity. Ask levels below this
+# (e.g. 0.001 on a resolved losing outcome) are ghosts: Polymarket rejects orders
+# under the 0.01 tick, and counting them invents arbitrage that can't be executed.
+MIN_ASK_PRICE = 0.02
+
+
 class PricingEngine:
     def __init__(self, target_shares: float = 50.0):
         self.target_shares = target_shares
@@ -22,6 +28,11 @@ class PricingEngine:
         total_cost = 0.0
         shares_accumulated = 0.0
         for price, size in sorted(asks_dict.items()):
+            # Ignore ghost/dead liquidity priced below the floor (e.g. a resolved
+            # losing outcome parked at 0.001). It can't be bought and would invent
+            # a phantom arbitrage signal.
+            if price < MIN_ASK_PRICE:
+                continue
             shares_needed = self.target_shares - shares_accumulated
             if size >= shares_needed:
                 total_cost += price * shares_needed
